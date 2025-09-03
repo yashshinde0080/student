@@ -1,5 +1,5 @@
 
-# Smart Attendance (Mini Project)
+# Smart Attendance
 
 A lightweight attendance system using **Streamlit + MongoDB + QR codes + OpenCV**.
 
