@@ -195,40 +195,17 @@ def make_barcode(student_id):
         st.error(f"Error generating barcode: {e}")
         return None
 
-def decode_qr_from_image(pil_img):
-    """Decode QR code from image"""
-    try:
-        arr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        detector = cv2.QRCodeDetector()
-        data, pts, _ = detector.detectAndDecode(arr)
-        if pts is not None and data: 
-            return data
-        return None
-    except Exception as e:
-        st.error(f"QR decode error: {e}")
-        return None
-
-def decode_barcode_from_image(pil_img):
-    """Decode barcode from image using pyzbar"""
+def decode_from_camera(pil_img):
+    """Decode QR code or barcode from camera image using pyzbar"""
     try:
         img_array = np.array(pil_img)
-        barcodes = pyzbar.decode(img_array)
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-        return None
+        codes = pyzbar.decode(img_array)
+        if codes:
+            return codes[0].data.decode('utf-8'), codes[0].type
+        return None, None
     except Exception as e:
-        st.error(f"Barcode decode error: {e}")
-        return None
-
-def decode_any_code_from_image(pil_img):
-    """Try to decode both QR codes and barcodes from image"""
-    qr_data = decode_qr_from_image(pil_img)
-    if qr_data:
-        return qr_data, "QR Code"
-    barcode_data = decode_barcode_from_image(pil_img)
-    if barcode_data:
-        return barcode_data, "Barcode"
-    return None, None
+        st.error(f"Decode error: {e}")
+        return None, None
 
 def mark_attendance(student_id, status, when_dt=None, course=None, method="manual"):
     """Mark attendance for a student"""
@@ -488,7 +465,7 @@ def display_session_attendance_form(session):
         if camera_image is not None:
             try:
                 img = Image.open(camera_image)
-                code_data, code_type = decode_any_code_from_image(img)
+                code_data, code_type = decode_from_camera(img)
                 
                 if code_data:
                     st.success(f"🔍 {code_type} detected: {code_data}")
@@ -733,118 +710,14 @@ elif nav == "Students":
                     except Exception as e:
                         st.error(f"Error adding student: {e}")
         
-        st.subheader("Add by QR/Barcode Scan")
-        st.info("Scan or upload an existing QR code or barcode to auto-fill the Student ID")
-        
-        # Camera Scan Form
-        st.markdown("#### 📷 Camera Scan")
-        with st.form("add_student_camera"):
-            st.markdown("**Instructions:**")
-            st.markdown("- Point your camera at the student's QR code or barcode")
-            st.markdown("- Ensure good lighting and hold steady")
-            st.markdown("- The Student ID will be auto-filled after scanning")
-            
-            camera_image = st.camera_input("Take a photo of QR code or barcode")
-            code_data = None
-            code_type = None
-            
-            if camera_image is not None:
-                try:
-                    img = Image.open(camera_image)
-                    st.image(img, caption="Captured Image", width=300)
-                    with st.spinner("Decoding QR code/barcode..."):
-                        code_data, code_type = decode_any_code_from_image(img)
-                    if code_data:
-                        st.success(f"🔍 {code_type} detected: {code_data}")
-                    else:
-                        st.warning("❌ No QR code or barcode detected. Please try again.")
-                except Exception as e:
-                    st.error(f"Error processing image: {str(e)}")
-            
-            camera_student_id = st.text_input("Student ID *", value=code_data if code_data else "", 
-                                            key="camera_student_id", help="Auto-filled from scan or enter manually")
-            camera_student_name = st.text_input("Student Name *")
-            camera_course = st.text_input("Course")
-            
-            if st.form_submit_button("Add Student (Camera)"):
-                if not camera_student_id or not camera_student_name:
-                    st.error("Student ID and Name are required")
-                elif students_col.find_one({"student_id": camera_student_id}):
-                    st.warning("⚠️ Student ID already exists")
-                else:
-                    try:
-                        qr_path = make_qr(camera_student_id)
-                        barcode_path = make_barcode(camera_student_id)
-                        students_col.insert_one({
-                            "student_id": camera_student_id, 
-                            "name": camera_student_name, 
-                            "course": camera_course,
-                            "qr_path": qr_path,
-                            "barcode_path": barcode_path
-                        })
-                        st.success(f"✅ Student {camera_student_name} added successfully with QR code and barcode generated")
-                    except Exception as e:
-                        st.error(f"Error adding student: {e}")
-        
-        # Image Upload Form
-        st.markdown("#### 📁 Upload Image")
-        with st.form("add_student_upload"):
-            st.markdown("**Instructions:**")
-            st.markdown("- Upload an image containing the student's QR code or barcode")
-            st.markdown("- Ensure the image is clear and well-lit")
-            st.markdown("- The Student ID will be auto-filled after decoding")
-            
-            uploaded_image = st.file_uploader("Upload an image containing QR code or barcode", 
-                                            type=['png', 'jpg', 'jpeg'])
-            upload_code_data = None
-            upload_code_type = None
-            
-            if uploaded_image is not None:
-                try:
-                    img = Image.open(uploaded_image)
-                    st.image(img, caption="Uploaded Image", width=300)
-                    with st.spinner("Decoding QR code/barcode..."):
-                        upload_code_data, upload_code_type = decode_any_code_from_image(img)
-                    if upload_code_data:
-                        st.success(f"🔍 {upload_code_type} detected: {upload_code_data}")
-                    else:
-                        st.warning("❌ No QR code or barcode detected. Please try again.")
-                except Exception as e:
-                    st.error(f"Error processing image: {str(e)}")
-            
-            upload_student_id = st.text_input("Student ID *", value=upload_code_data if upload_code_data else "", 
-                                            key="upload_student_id", help="Auto-filled from upload or enter manually")
-            upload_student_name = st.text_input("Student Name *")
-            upload_course = st.text_input("Course")
-            
-            if st.form_submit_button("Add Student (Upload)"):
-                if not upload_student_id or not upload_student_name:
-                    st.error("Student ID and Name are required")
-                elif students_col.find_one({"student_id": upload_student_id}):
-                    st.warning("⚠️ Student ID already exists")
-                else:
-                    try:
-                        qr_path = make_qr(upload_student_id)
-                        barcode_path = make_barcode(upload_student_id)
-                        students_col.insert_one({
-                            "student_id": upload_student_id, 
-                            "name": upload_student_name, 
-                            "course": upload_course,
-                            "qr_path": qr_path,
-                            "barcode_path": barcode_path
-                        })
-                        st.success(f"✅ Student {upload_student_name} added successfully with QR code and barcode generated")
-                    except Exception as e:
-                        st.error(f"Error adding student: {e}")
-        
-        # Hardware Scanner Form
-        st.markdown("#### ⌨️ Hardware Scanner")
+        st.subheader("Add by QR/Barcode Scanner")
+        st.info("💡 Use this option if you have a barcode/QR code scanner device connected to your computer.")
         with st.form("add_student_scanner"):
             st.markdown("**Instructions:**")
-            st.markdown("- Connect your barcode/QR code scanner to your computer")
             st.markdown("- Click in the input field below")
-            st.markdown("- Scan the student's QR code or barcode")
-            st.markdown("- The Student ID will be auto-filled after scanning")
+            st.markdown("- Scan the student's QR code or barcode with your scanner device")
+            st.markdown("- The code data will appear automatically")
+            st.markdown("- Enter the student's name and course, then click 'Add Student' to save")
             
             scanner_code = st.text_input("Scan QR code or barcode here:", 
                                        placeholder="Click here and scan with your scanner", 
@@ -857,7 +730,7 @@ elif nav == "Students":
             scanner_student_name = st.text_input("Student Name *")
             scanner_course = st.text_input("Course")
             
-            if st.form_submit_button("Add Student (Scanner)"):
+            if st.form_submit_button("Add Student"):
                 if not scanner_student_id or not scanner_student_name:
                     st.error("Student ID and Name are required")
                 elif students_col.find_one({"student_id": scanner_student_id}):
@@ -970,10 +843,10 @@ elif nav == "Scan QR/Barcode":
     st.title("📷 Scan QR Code or Barcode for Attendance")
     
     chosen_date = st.date_input("Select Date", value=date.today())
-    st.info("📱 Take a photo of the student's QR code or barcode using the camera below")
+    st.info("📱 Scan a student's QR code or barcode using the camera or a hardware scanner")
     
     scan_method = st.radio("Choose scanning method:", 
-                          ["📷 Camera", "📁 Upload Image", "⌨️ Manual Barcode Scanner"])
+                          ["📷 Camera", "⌨️ Manual Barcode Scanner"])
     
     if scan_method == "📷 Camera":
         camera_image = st.camera_input("Take a photo of QR code or barcode")
@@ -984,7 +857,7 @@ elif nav == "Scan QR/Barcode":
                 st.image(img, caption="Captured Image", width=300)
                 
                 with st.spinner("Decoding QR code/barcode..."):
-                    code_data, code_type = decode_any_code_from_image(img)
+                    code_data, code_type = decode_from_camera(img)
                     
                 if code_data:
                     st.success(f"🔍 {code_type} detected: {code_data}")
@@ -1013,58 +886,21 @@ elif nav == "Scan QR/Barcode":
             except Exception as e:
                 st.error(f"Error processing image: {str(e)}")
     
-    elif scan_method == "📁 Upload Image":
-        uploaded_image = st.file_uploader("Upload an image containing QR code or barcode", 
-                                         type=['png', 'jpg', 'jpeg'])
-        
-        if uploaded_image is not None:
-            try:
-                img = Image.open(uploaded_image)
-                st.image(img, caption="Uploaded Image", width=300)
-                
-                with st.spinner("Decoding QR code/barcode..."):
-                    code_data, code_type = decode_any_code_from_image(img)
-                    
-                if code_data:
-                    st.success(f"🔍 {code_type} detected: {code_data}")
-                    
-                    student = students_col.find_one({"student_id": code_data})
-                    if not student:
-                        st.error("❌ Student not found in database")
-                    else:
-                        combined_datetime = datetime.combine(chosen_date, datetime.now().time())
-                        result = mark_attendance(
-                            code_data, 
-                            1,
-                            combined_datetime, 
-                            course=student.get("course"),
-                            method="upload_scan"
-                        )
-                        
-                        if "error" in result and result["error"] == "already":
-                            st.warning(f"⚠️ Attendance already marked for {student.get('name', code_data)} on {chosen_date}")
-                        else:
-                            st.success(f"✅ Marked {student.get('name', code_data)} as PRESENT for {chosen_date}")
-                else:
-                    st.warning("❌ No QR code or barcode detected in the image. Please try again.")
-                    
-            except Exception as e:
-                st.error(f"Error processing image: {str(e)}")
-    
     elif scan_method == "⌨️ Manual Barcode Scanner":
         st.info("💡 Use this option if you have a barcode scanner device connected to your computer.")
         st.markdown("**Instructions:**")
-        st.markdown("1. Click in the input field below")
-        st.markdown("2. Scan the barcode with your scanner device")
-        st.markdown("3. The barcode data will appear automatically")
-        st.markdown("4. Click 'Mark Attendance' to save")
+        st.markdown("- Click in the input field below")
+        st.markdown("- Scan the student's QR code or barcode with your scanner device")
+        st.markdown("- The code data will appear automatically")
+        st.markdown("- Click 'Mark Attendance' to save")
         
         with st.form("barcode_scanner"):
-            scanned_code = st.text_input("Scan barcode here:", placeholder="Click here and scan with your barcode scanner")
+            scanned_code = st.text_input("Scan QR code or barcode here:", 
+                                       placeholder="Click here and scan with your scanner")
             
             if st.form_submit_button("✅ Mark Attendance"):
                 if not scanned_code:
-                    st.error("Please scan a barcode first")
+                    st.error("Please scan a QR code or barcode first")
                 else:
                     student = students_col.find_one({"student_id": scanned_code})
                     if not student:
@@ -1526,7 +1362,7 @@ elif nav == "Attendance Records":
         course_filter = st.selectbox("Course Filter", courses)
     
     method_filter = st.selectbox("Attendance Method Filter", [
-        "All", "manual_entry", "camera_scan", "upload_scan", "scanner_device", 
+        "All", "manual_entry", "camera_scan", "scanner_device", 
         "bulk_entry", "session_link", "personal_link"
     ])
     
@@ -1732,99 +1568,99 @@ elif nav == "Teachers":
 # -------------------- Footer --------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Smart Attendance System v3.0 Enhanced**")
-st.sidebar.markdown("🔧 Database: " + ("MongoDB" if use_mongo else "JSON Files"))
+# st.sidebar.markdown("🔧 Database: " + ("MongoDB" if use_mongo else "JSON Files"))
 
-if nav == "Dashboard":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tip**: Use the pivot view to see attendance patterns across multiple days. Present=1, Absent=0.")
+# if nav == "Dashboard":
+#     st.sidebar.markdown("---")
+#     st.sidebar.info("💡 **Tip**: Use the pivot view to see attendance patterns across multiple days. Present=1, Absent=0.")
 
-elif nav == "Scan QR/Barcode":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tips**:\n- Ensure good lighting for camera scanning\n- Hold codes steady for best results\n- Use barcode scanner option for hardware scanners")
+# elif nav == "Scan QR/Barcode":
+#     st.sidebar.markdown("---")
+#     st.sidebar.info("💡 **Tips**:\n- Ensure good lighting for camera scanning\n- Hold codes steady for best results\n- Use barcode scanner option for hardware scanners")
 
-elif nav == "Students":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tip**: Both QR codes and barcodes are generated for each student for maximum compatibility. Use the QR/barcode scan options to add students with existing codes.")
+# elif nav == "Students":
+#     st.sidebar.markdown("---")
+#     st.sidebar.info("💡 **Tip**: Both QR codes and barcodes are generated for each student. Use the QR/barcode scanner to add students with existing codes.")
 
-elif nav == "Share Links":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Link Types**:\n- Session links: For entire classes\n- Student links: Personal attendance links\n- Both expire automatically for security")
+# elif nav == "Share Links":
+#     st.sidebar.markdown("---")
+#     st.sidebar.info("💡 **Link Types**:\n- Session links: For entire classes\n- Student links: Personal attendance links\n- Both expire automatically for security")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("📦 **Required Libraries:**")
-st.sidebar.markdown("""
-**Core (Required):**
-- `streamlit`
-- `pandas`
-- `pymongo`
-- `qrcode`
-- `opencv-python`
-- `Pillow`
-- `werkzeug`
-- `numpy`
+# st.sidebar.markdown("---")
+# st.sidebar.markdown("📦 **Required Libraries:**")
+# st.sidebar.markdown("""
+# **Core (Required):**
+# - `streamlit`
+# - `pandas`
+# - `pymongo`
+# - `qrcode`
+# - `opencv-python`
+# - `Pillow`
+# - `werkzeug`
+# - `numpy`
 
-**Optional (for barcode support):**
-- `pyzbar` (requires system libraries)
-- `python-barcode`
-""")
+# **Optional (for barcode support):**
+# - `pyzbar` (requires system libraries)
+# - `python-barcode`
+# """)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("🚀 **Features Status:**")
-features_status = "✅ QR Code scanning & generation\n"
-if BARCODE_GENERATION_AVAILABLE:
-    features_status += "✅ Barcode generation\n"
-else:
-    features_status += "❌ Barcode generation (install python-barcode)\n"
+# st.sidebar.markdown("---")
+# st.sidebar.markdown("🚀 **Features Status:**")
+# features_status = "✅ QR Code scanning & generation\n"
+# if BARCODE_GENERATION_AVAILABLE:
+#     features_status += "✅ Barcode generation\n"
+# else:
+#     features_status += "❌ Barcode generation (install python-barcode)\n"
     
-if PYZBAR_AVAILABLE:
-    features_status += "✅ Barcode image scanning\n"
-else:
-    features_status += "❌ Barcode image scanning (install pyzbar)\n"
+# if PYZBAR_AVAILABLE:
+#     features_status += "✅ Barcode/QR camera scanning\n"
+# else:
+#     features_status += "❌ Barcode/QR camera scanning (install pyzbar)\n"
 
-features_status += """✅ Shareable attendance links
-✅ Session-based attendance
-✅ Personal student links
-✅ Multiple scanning methods
-✅ Hardware scanner support
-✅ Add students by existing QR/barcode
-✅ Enhanced security"""
+# features_status += """✅ Shareable attendance links
+# ✅ Session-based attendance
+# ✅ Personal student links
+# ✅ Camera scanning
+# ✅ Hardware scanner support
+# ✅ Add students by existing QR/barcode
+# ✅ Enhanced security"""
 
-st.sidebar.markdown(features_status)
+# st.sidebar.markdown(features_status)
 
-if st.sidebar.button("📖 Deployment Guide"):
-    st.info("""
-    ## 🚀 Deployment Instructions
+# if st.sidebar.button("📖 Deployment Guide"):
+#     st.info("""
+#     ## 🚀 Deployment Instructions
     
-    ### Required Python Packages:
-    ```bash
-    pip install streamlit pandas pymongo qrcode opencv-python pyzbar python-barcode Pillow werkzeug numpy
-    ```
+#     ### Required Python Packages:
+#     ```bash
+#     pip install streamlit pandas pymongo qrcode opencv-python pyzbar python-barcode Pillow werkzeug numpy
+#     ```
     
-    ### For QR/Barcode scanning on Linux:
-    ```bash
-    sudo apt-get install libzbar0
-    ```
+#     ### For QR/Barcode scanning on Linux:
+#     ```bash
+#     sudo apt-get install libzbar0
+#     ```
     
-    ### Environment Variables (Optional):
-    - `MONGODB_URI`: MongoDB connection string
-    - `MONGODB_DB`: Database name
+#     ### Environment Variables (Optional):
+#     - `MONGODB_URI`: MongoDB connection string
+#     - `MONGODB_DB`: Database name
     
-    ### Run the application:
-    ```bash
-    streamlit run app.py
-    ```
+#     ### Run the application:
+#     ```bash
+#     streamlit run app.py
+#     ```
     
-    ### Features:
-    1. **QR Code & Barcode Generation**: Automatic generation for all students
-    2. **Multiple Scanning Methods**: Camera, upload, hardware scanner
-    3. **Add Students by QR/Barcode**: Scan existing codes to add students
-    4. **Shareable Links**: Session and personal attendance links
-    5. **Enhanced Security**: Token-based links with expiration
-    6. **Flexible Database**: MongoDB or JSON file storage
+#     ### Features:
+#     1. **QR Code & Barcode Generation**: Automatic generation for all students
+#     2. **Scanning Methods**: Camera and hardware scanner
+#     3. **Add Students by QR/Barcode**: Scan existing codes with a hardware scanner
+#     4. **Shareable Links**: Session and personal attendance links
+#     5. **Enhanced Security**: Token-based links with expiration
+#     6. **Flexible Database**: MongoDB or JSON file storage
     
-    ### Sharing Links:
-    - Session links: Share with entire class for specific sessions
-    - Student links: Personal links for individual students
-    - All links expire automatically for security
-    - Generate QR codes for easy sharing
-    """)
+#     ### Sharing Links:
+#     - Session links: Share with entire class for specific sessions
+#     - Student links: Personal links for individual students
+#     - All links expire automatically for security
+#     - Generate QR codes for easy sharing
+#     """)

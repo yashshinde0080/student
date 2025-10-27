@@ -1,10 +1,21 @@
-import os, io, zipfile, json, secrets, string
+import os
+import io
+import zipfile
+import json
+import secrets
+import string
+import re
 from datetime import datetime, date, timedelta
 import pandas as pd
 import qrcode
 from PIL import Image
 import cv2
 import numpy as np
+from pymongo import MongoClient, errors as mongo_errors
+from werkzeug.security import generate_password_hash, check_password_hash
+import streamlit as st
+from streamlit_cookies_manager import EncryptedCookieManager
+
 try:
     from pyzbar import pyzbar
     PYZBAR_AVAILABLE = True
@@ -14,20 +25,219 @@ except ImportError:
 try:
     import barcode
     from barcode.writer import ImageWriter
+    import shutil
     BARCODE_GENERATION_AVAILABLE = True
 except ImportError:
     BARCODE_GENERATION_AVAILABLE = False
 
-import streamlit as st
-from pymongo import MongoClient, errors as mongo_errors
-from werkzeug.security import generate_password_hash, check_password_hash
+st.set_page_config(page_title="Smart Attendance — Enhanced", layout="wide", initial_sidebar_state="collapsed")
 
-st.set_page_config(page_title="Smart Attendance — Enhanced", layout="wide")
+# -------------------- Cookie Manager --------------------
+cookies = EncryptedCookieManager(prefix="attendance_", password=os.getenv("COOKIE_SECRET", "supersecretkey"))
+if not cookies.ready():
+    st.stop()
 
-# -------------------- Storage (MongoDB or JSON fallback) --------------------
+# -------------------- MongoDB Configuration --------------------
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("MONGODB_DB", "smart_attendance_enhanced")
 
+# -------------------- User Management Class --------------------
+class UserManager:
+    def __init__(self, users_collection):
+        self.users_col = users_collection
+        self.PASSWORD_MIN_LENGTH = 8
+        self.PASSWORD_REGEX = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
+        self.MAX_LOGIN_ATTEMPTS = 5
+        self.LOCKOUT_DURATION = timedelta(minutes=30)
+
+    def validate_email(self, email):
+        """Validate email format"""
+        email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(email_regex, email))
+
+    def validate_password(self, password):
+        """Validate password strength"""
+        if not password:
+            return False, "Password cannot be empty"
+        if len(password) < self.PASSWORD_MIN_LENGTH:
+            return False, f"Password must be at least {self.PASSWORD_MIN_LENGTH} characters"
+        if not re.match(self.PASSWORD_REGEX, password):
+            return False, "Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character"
+        return True, ""
+
+    def create_user(self, username, password, email, name, role="teacher"):
+        """Create a new user with validated credentials"""
+        if not username or len(username) < 3:
+            return False, "Username must be at least 3 characters"
+        if not self.validate_email(email):
+            return False, "Invalid email format"
+        if self.users_col.find_one({"username": username}):
+            return False, "Username already exists"
+        if self.users_col.find_one({"email": email}):
+            return False, "Email already exists"
+        
+        is_valid, error = self.validate_password(password)
+        if not is_valid:
+            return False, error
+
+        try:
+            user_data = {
+                "username": username,
+                "password": generate_password_hash(password, method='pbkdf2:sha256:600000'),
+                "email": email,
+                "name": name,
+                "role": role,
+                "created_at": datetime.now() if use_mongo else datetime.now().isoformat(),
+                "last_login": None,
+                "failed_attempts": 0,
+                "is_locked": False,
+                "lockout_until": None,
+                "status": "pending"
+            }
+            self.users_col.insert_one(user_data)
+            return True, "User created successfully. Please check your email for verification."
+        except Exception as e:
+            return False, f"Error creating user: {str(e)}"
+
+    def authenticate_user(self, username, password):
+        """Authenticate user with rate limiting and lockout"""
+        user = self.users_col.find_one({"username": username})
+        if not user:
+            return False, "User not found"
+        
+        if user.get("is_locked", False):
+            lockout_until = user.get("lockout_until")
+            if lockout_until and (use_mongo and lockout_until > datetime.now() or 
+                                not use_mongo and lockout_until > datetime.now().isoformat()):
+                return False, f"Account locked until {lockout_until}"
+            else:
+                self.users_col.update_one(
+                    {"username": username},
+                    {"$set": {"is_locked": False, "failed_attempts": 0, "lockout_until": None}}
+                )
+
+        if user.get("status") != "active":
+            return False, "Account is not verified or is inactive"
+
+        if check_password_hash(user.get("password"), password):
+            self.users_col.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "last_login": datetime.now() if use_mongo else datetime.now().isoformat(),
+                        "failed_attempts": 0,
+                        "lockout_until": None
+                    }
+                }
+            )
+            return True, {
+                "username": username,
+                "role": user.get("role"),
+                "name": user.get("name"),
+                "email": user.get("email")
+            }
+        else:
+            failed_attempts = user.get("failed_attempts", 0) + 1
+            is_locked = failed_attempts >= self.MAX_LOGIN_ATTEMPTS
+            lockout_until = datetime.now() + self.LOCKOUT_DURATION if is_locked else None
+            
+            self.users_col.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "failed_attempts": failed_attempts,
+                        "is_locked": is_locked,
+                        "lockout_until": lockout_until
+                    }
+                }
+            )
+            return False, "Invalid password" if not is_locked else f"Account locked until {lockout_until}"
+
+    def change_password(self, username, current_password, new_password):
+        """Change user password with validation"""
+        auth_success, _ = self.authenticate_user(username, current_password)
+        if not auth_success:
+            return False, "Current password is incorrect"
+
+        is_valid, error = self.validate_password(new_password)
+        if not is_valid:
+            return False, error
+
+        try:
+            self.users_col.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "password": generate_password_hash(new_password, method='pbkdf2:sha256:600000'),
+                        "last_modified": datetime.now() if use_mongo else datetime.now().isoformat()
+                    }
+                }
+            )
+            return True, "Password updated successfully"
+        except Exception as e:
+            return False, f"Error updating password: {str(e)}"
+
+    def generate_reset_token(self, username):
+        """Generate a password reset token"""
+        try:
+            token = generate_secure_token()
+            expires = datetime.now() + timedelta(hours=24)
+            self.users_col.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "password_reset_token": token,
+                        "password_reset_expires": expires if use_mongo else expires.isoformat()
+                    }
+                }
+            )
+            return True, token
+        except Exception as e:
+            return False, f"Error generating reset token: {str(e)}"
+
+    def reset_password(self, token, new_password):
+        """Reset password using a token"""
+        is_valid, error = self.validate_password(new_password)
+        if not is_valid:
+            return False, error
+
+        query = {
+            "password_reset_token": token,
+            "password_reset_expires": {"$gt": datetime.now()} if use_mongo else {"$gt": datetime.now().isoformat()}
+        }
+        user = self.users_col.find_one(query)
+
+        if not user:
+            return False, "Invalid or expired reset token"
+
+        try:
+            self.users_col.update_one(
+                {"password_reset_token": token},
+                {
+                    "$set": {
+                        "password": generate_password_hash(new_password, method='pbkdf2:sha256:600000'),
+                        "password_reset_token": None,
+                        "password_reset_expires": None,
+                        "last_modified": datetime.now() if use_mongo else datetime.now().isoformat()
+                    }
+                }
+            )
+            return True, "Password reset successfully"
+        except Exception as e:
+            return False, f"Error resetting password: {str(e)}"
+
+    def verify_email(self, username):
+        """Mock email verification (set status to active)"""
+        try:
+            self.users_col.update_one(
+                {"username": username},
+                {"$set": {"status": "active"}}
+            )
+            return True, "Email verified successfully"
+        except Exception as e:
+            return False, f"Error verifying email: {str(e)}"
+
+# -------------------- Database Setup --------------------
 use_mongo = True
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
@@ -39,10 +249,11 @@ try:
     sessions_col = db["attendance_sessions"]
     links_col = db["attendance_links"]
     
-    # Create indexes
-    students_col.create_index("student_id", unique=True)
-    att_col.create_index([("student_id",1),("date",1)], unique=True)
     users_col.create_index("username", unique=True)
+    users_col.create_index("email", unique=True, sparse=True)
+    users_col.create_index("password_reset_token")
+    students_col.create_index("student_id", unique=True)
+    att_col.create_index([("student_id", 1), ("date", 1)], unique=True)
     sessions_col.create_index("session_id", unique=True)
     sessions_col.create_index("expires_at", expireAfterSeconds=0)
     links_col.create_index("link_id", unique=True)
@@ -60,7 +271,7 @@ except Exception as e:
     
     for f in (USERS_FILE, STUDENTS_FILE, ATT_FILE, SESSIONS_FILE, LINKS_FILE):
         if not os.path.exists(f):
-            with open(f,"w") as fh:
+            with open(f, "w") as fh:
                 json.dump([], fh)
 
     class SimpleCol:
@@ -69,7 +280,7 @@ except Exception as e:
             
         def _load(self):
             try:
-                with open(self.path,"r") as fh:
+                with open(self.path, "r") as fh:
                     data = json.load(fh)
                 if self.path.endswith(("sessions.json", "links.json")):
                     now = datetime.now().isoformat()
@@ -80,16 +291,16 @@ except Exception as e:
                 return []
                 
         def _save(self, data):
-            with open(self.path,"w") as fh:
+            with open(self.path, "w") as fh:
                 json.dump(data, fh, default=str, indent=2)
                 
         def find_one(self, filt):
             data = self._load()
             for d in data:
                 ok = True
-                for k,v in (filt or {}).items():
+                for k, v in (filt or {}).items():
                     if d.get(k) != v: 
-                        ok=False
+                        ok = False
                         break
                 if ok: 
                     return d
@@ -102,9 +313,9 @@ except Exception as e:
             out = []
             for d in data:
                 ok = True
-                for k,v in filt.items():
+                for k, v in filt.items():
                     if d.get(k) != v: 
-                        ok=False
+                        ok = False
                         break
                 if ok: 
                     out.append(d)
@@ -118,19 +329,19 @@ except Exception as e:
             
         def update_one(self, filt, update, upsert=False):
             data = self._load()
-            found=False
-            for i,d in enumerate(data):
-                ok=True
-                for k,v in filt.items():
+            found = False
+            for i, d in enumerate(data):
+                ok = True
+                for k, v in filt.items():
                     if d.get(k) != v: 
-                        ok=False
+                        ok = False
                         break
                 if ok:
                     if "$set" in update:
-                        for kk,vv in update["$set"].items(): 
-                            d[kk]=vv
-                    data[i]=d
-                    found=True
+                        for kk, vv in update["$set"].items(): 
+                            d[kk] = vv
+                    data[i] = d
+                    found = True
                     break
             if not found and upsert:
                 new = dict(filt)
@@ -141,18 +352,18 @@ except Exception as e:
             
         def delete_many(self, filt):
             data = self._load()
-            out=[]
-            removed=0
+            out = []
+            removed = 0
             for d in data:
-                match=True
-                for k,v in (filt or {}).items():
+                match = True
+                for k, v in (filt or {}).items():
                     if d.get(k) != v: 
-                        match=False
+                        match = False
                         break
                 if not match: 
                     out.append(d)
                 else: 
-                    removed+=1
+                    removed += 1
             self._save(out)
             return {"deleted_count": removed}
             
@@ -164,6 +375,9 @@ except Exception as e:
     att_col = SimpleCol(ATT_FILE)
     sessions_col = SimpleCol(SESSIONS_FILE)
     links_col = SimpleCol(LINKS_FILE)
+
+# Initialize UserManager
+user_manager = UserManager(users_col)
 
 # -------------------- Helpers --------------------
 QR_FOLDER = os.path.join(os.path.dirname(__file__), "qrcodes")
@@ -195,40 +409,17 @@ def make_barcode(student_id):
         st.error(f"Error generating barcode: {e}")
         return None
 
-def decode_qr_from_image(pil_img):
-    """Decode QR code from image"""
-    try:
-        arr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        detector = cv2.QRCodeDetector()
-        data, pts, _ = detector.detectAndDecode(arr)
-        if pts is not None and data: 
-            return data
-        return None
-    except Exception as e:
-        st.error(f"QR decode error: {e}")
-        return None
-
-def decode_barcode_from_image(pil_img):
-    """Decode barcode from image using pyzbar"""
+def decode_from_camera(pil_img):
+    """Decode QR code or barcode from camera image using pyzbar"""
     try:
         img_array = np.array(pil_img)
-        barcodes = pyzbar.decode(img_array)
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-        return None
+        codes = pyzbar.decode(img_array)
+        if codes:
+            return codes[0].data.decode('utf-8'), codes[0].type
+        return None, None
     except Exception as e:
-        st.error(f"Barcode decode error: {e}")
-        return None
-
-def decode_any_code_from_image(pil_img):
-    """Try to decode both QR codes and barcodes from image"""
-    qr_data = decode_qr_from_image(pil_img)
-    if qr_data:
-        return qr_data, "QR Code"
-    barcode_data = decode_barcode_from_image(pil_img)
-    if barcode_data:
-        return barcode_data, "Barcode"
-    return None, None
+        st.error(f"Decode error: {e}")
+        return None, None
 
 def mark_attendance(student_id, status, when_dt=None, course=None, method="manual"):
     """Mark attendance for a student"""
@@ -368,34 +559,239 @@ def pivot_attendance(start, end, course=None):
 
 # -------------------- Auth --------------------
 if "auth" not in st.session_state:
-    st.session_state.auth = {"logged_in": False, "username": None, "role": None}
+    st.session_state.auth = {"logged_in": False, "username": None, "role": None, "name": None, "email": None}
 if "unlocked" not in st.session_state:
     st.session_state.unlocked = {}
+if "page" not in st.session_state:
+    st.session_state.page = "login"
 
 def bootstrap_admin():
-    if use_mongo:
-        if users_col.count_documents({}) == 0:
-            pw = generate_password_hash("admin123")
-            users_col.insert_one({"username":"admin","password":pw,"role":"admin"})
-    else:
-        if users_col.count_documents({}) == 0:
-            users_col.insert_one({"username":"admin","password":generate_password_hash("admin123"),"role":"admin"})
+    """Create default admin user if none exists"""
+    if users_col.count_documents({}) == 0:
+        success, message = user_manager.create_user(
+            username="admin",
+            password="Admin@123",
+            email="admin@example.com",
+            name="Administrator",
+            role="admin"
+        )
+        if success:
+            user_manager.verify_email("admin")
+        else:
+            st.error(message)
 
-bootstrap_admin()
+def login_flow():
+    """Login page with improved UI"""
+    st.markdown("""
+        <style>
+        .login-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            background-color: #f9f9f9;
+        }
+        .login-title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .stButton>button {
+            width: 100%;
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .stButton>button:hover {
+            background-color: #45a049;
+        }
+        .stTextInput {
+            margin-bottom: 15px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-def authenticate(username, password):
-    user = users_col.find_one({"username": username})
-    if not user: 
-        return False
-    stored = user.get("password")
-    try:
-        return check_password_hash(stored, password)
-    except Exception:
-        return stored == password
+    st.markdown('<div class="login-container">', unsafe_allow_html=True)
+    st.markdown('<h2 class="login-title">🔐 Smart Attendance Login</h2>', unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        username = st.text_input("Username", placeholder="Enter your username")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.form_submit_button("Login"):
+                user_data = user_manager.authenticate_user(username, password)
+                if user_data[0]:
+                    st.session_state.auth.update({
+                        "logged_in": True,
+                        "username": user_data[1]["username"],
+                        "role": user_data[1]["role"],
+                        "name": user_data[1]["name"],
+                        "email": user_data[1]["email"]
+                    })
+                    cookies["session"] = user_data[1]["username"]
+                    cookies.save()
+                    st.session_state.page = "dashboard"
+                    st.success(f"Welcome, {user_data[1].get('name', username)}!")
+                    st.rerun()
+                else:
+                    st.error(user_data[1])
+        with col2:
+            if st.form_submit_button("Sign Up"):
+                st.session_state.page = "signup"
+                st.rerun()
+
+    st.markdown('<a href="#" onclick="st.session_state.page=\'forgot_password\';st.rerun()">Forgot Password?</a>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def signup_flow():
+    """Signup page with improved UI"""
+    st.markdown("""
+        <style>
+        .signup-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            background-color: #f9f9f9;
+        }
+        .signup-title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="signup-container">', unsafe_allow_html=True)
+    st.markdown('<h2 class="signup-title">📝 Sign Up</h2>', unsafe_allow_html=True)
+
+    with st.form("signup_form"):
+        username = st.text_input("Username *", placeholder="Choose a username (min 3 characters)")
+        email = st.text_input("Email *", placeholder="Enter your email")
+        name = st.text_input("Full Name", placeholder="Enter your full name")
+        password = st.text_input("Password *", type="password", placeholder="Create a password")
+        confirm_password = st.text_input("Confirm Password *", type="password", placeholder="Confirm your password")
+        role = st.selectbox("Role", ["teacher"], disabled=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.form_submit_button("Sign Up"):
+                if password != confirm_password:
+                    st.error("Passwords do not match")
+                else:
+                    success, message = user_manager.create_user(
+                        username=username,
+                        password=password,
+                        email=email,
+                        name=name,
+                        role="teacher"
+                    )
+                    if success:
+                        st.success(message)
+                        st.session_state.page = "login"
+                        st.rerun()
+                    else:
+                        st.error(message)
+        with col2:
+            if st.form_submit_button("Back to Login"):
+                st.session_state.page = "login"
+                st.rerun()
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def forgot_password_flow():
+    """Forgot password page"""
+    st.markdown("""
+        <style>
+        .forgot-password-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            background-color: #f9f9f9;
+        }
+        .forgot-password-title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="forgot-password-container">', unsafe_allow_html=True)
+    st.markdown('<h2 class="forgot-password-title">🔑 Reset Password</h2>', unsafe_allow_html=True)
+
+    with st.form("forgot_password_form"):
+        email = st.text_input("Email", placeholder="Enter your email")
+        if st.form_submit_button("Send Reset Link"):
+            user = users_col.find_one({"email": email})
+            if user:
+                success, token = user_manager.generate_reset_token(user["username"])
+                if success:
+                    base_url = st.get_option('server.baseUrlPath') or 'http://localhost:8501'
+                    reset_url = f"{base_url}?reset_token={token}"
+                    st.success("Reset link sent to your email!")
+                    st.text_area("Reset Link (mock email):", value=reset_url, height=100)
+                else:
+                    st.error(token)
+            else:
+                st.error("Email not found")
+        
+        if st.form_submit_button("Back to Login"):
+            st.session_state.page = "login"
+            st.rerun()
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def reset_password_flow(token):
+    """Password reset page"""
+    st.markdown("""
+        <style>
+        .reset-password-container {
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            background-color: #f9f9f9;
+        }
+        .reset-password-title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="reset-password-container">', unsafe_allow_html=True)
+    st.markdown('<h2 class="reset-password-title">🔑 Reset Password</h2>', unsafe_allow_html=True)
+
+    with st.form("reset_password_form"):
+        new_password = st.text_input("New Password", type="password")
+        confirm_password = st.text_input("Confirm New Password", type="password")
+        if st.form_submit_button("Reset Password"):
+            if new_password != confirm_password:
+                st.error("Passwords do not match")
+            else:
+                success, message = user_manager.reset_password(token, new_password)
+                if success:
+                    st.success(message)
+                    st.session_state.page = "login"
+                    st.rerun()
+                else:
+                    st.error(message)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # -------------------- URL Parameter Handling --------------------
 def handle_url_params():
-    """Handle URL parameters for attendance links and sessions"""
+    """Handle URL parameters for attendance links, sessions, and password reset"""
     query_params = st.query_params
     
     if "session" in query_params:
@@ -405,6 +801,10 @@ def handle_url_params():
     if "student_link" in query_params:
         link_id = query_params["student_link"]
         return handle_student_attendance_link(link_id)
+    
+    if "reset_token" in query_params:
+        st.session_state.page = "reset_password"
+        return reset_password_flow(query_params["reset_token"])
     
     return None
 
@@ -488,7 +888,7 @@ def display_session_attendance_form(session):
         if camera_image is not None:
             try:
                 img = Image.open(camera_image)
-                code_data, code_type = decode_any_code_from_image(img)
+                code_data, code_type = decode_from_camera(img)
                 
                 if code_data:
                     st.success(f"🔍 {code_type} detected: {code_data}")
@@ -593,36 +993,37 @@ def display_student_attendance_form(link):
             
             st.balloons()
 
+# -------------------- Main Application Logic --------------------
+bootstrap_admin()
+
+# Check cookie-based session
+if "session" in cookies and not st.session_state.auth["logged_in"]:
+    user_data = user_manager.authenticate_user(cookies["session"], None)  # Check if user exists
+    if user_data[0]:
+        st.session_state.auth.update({
+            "logged_in": True,
+            "username": user_data[1]["username"],
+            "role": user_data[1]["role"],
+            "name": user_data[1]["name"],
+            "email": user_data[1]["email"]
+        })
+        st.session_state.page = "dashboard"
+
 if handle_url_params():
     st.stop()
 
-def login_flow():
-    st.title("🔐 Admin portal")
-    st.info("Default admin credentials: username='admin', password='admin123'")
-    
-    with st.form("login"):
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        if st.form_submit_button("Login"):
-            if authenticate(u,p):
-                user_data = users_col.find_one({"username":u})
-                st.session_state.auth.update({
-                    "logged_in": True, 
-                    "username": u, 
-                    "role": user_data.get("role","teacher")
-                })
-                st.success("Logged in successfully!")
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
+if not st.session_state.auth["logged_in"]:
+    if st.session_state.page == "login":
+        login_flow()
+    elif st.session_state.page == "signup":
+        signup_flow()
+    elif st.session_state.page == "forgot_password":
+        forgot_password_flow()
     st.stop()
 
-if not st.session_state.auth["logged_in"]:
-    login_flow()
-
-# Sidebar and nav
+# -------------------- Sidebar and Navigation --------------------
 st.sidebar.title("Smart Attendance — Enhanced")
-st.sidebar.write(f"👤 {st.session_state.auth['username']} ({st.session_state.auth['role']})")
+st.sidebar.write(f"👤 {st.session_state.auth.get('name', st.session_state.auth['username'])} ({st.session_state.auth['role']})")
 
 nav = st.sidebar.radio("Navigate to:", [
     "Dashboard",
@@ -634,12 +1035,18 @@ nav = st.sidebar.radio("Navigate to:", [
     "Attendance Records",
     "Settings",
     "Teachers"
-])
+], key="nav")
 
-if st.sidebar.button("Logout"):
-    st.session_state.auth = {"logged_in": False, "username": None, "role": None}
-    st.session_state.unlocked = {}
-    st.rerun()
+if st.sidebar.button("Logout", type="secondary"):
+    with st.form("logout_confirm"):
+        st.warning("Are you sure you want to logout?")
+        if st.form_submit_button("Confirm Logout"):
+            st.session_state.auth = {"logged_in": False, "username": None, "role": None, "name": None, "email": None}
+            st.session_state.unlocked = {}
+            st.session_state.page = "login"
+            cookies["session"] = ""
+            cookies.save()
+            st.rerun()
 
 # Helper: re-auth per page
 def require_reauth(page):
@@ -652,14 +1059,15 @@ def require_reauth(page):
         u = st.text_input("Username (current)")
         p = st.text_input("Password", type="password")
         if st.form_submit_button("Unlock"):
+            user_data = user_manager.authenticate_user(u, p)
             if u != st.session_state.auth["username"]:
                 st.error("Please use the currently logged-in username")
-            elif authenticate(u,p):
+            elif user_data[0]:
                 st.session_state.unlocked[page] = True
                 st.success("✅ Unlocked for this session")
                 st.rerun()
             else:
-                st.error("Invalid credentials")
+                st.error(user_data[1])
     st.stop()
 
 # -------------------- Pages --------------------
@@ -733,118 +1141,14 @@ elif nav == "Students":
                     except Exception as e:
                         st.error(f"Error adding student: {e}")
         
-        st.subheader("Add by QR/Barcode Scan")
-        st.info("Scan or upload an existing QR code or barcode to auto-fill the Student ID")
-        
-        # Camera Scan Form
-        st.markdown("#### 📷 Camera Scan")
-        with st.form("add_student_camera"):
-            st.markdown("**Instructions:**")
-            st.markdown("- Point your camera at the student's QR code or barcode")
-            st.markdown("- Ensure good lighting and hold steady")
-            st.markdown("- The Student ID will be auto-filled after scanning")
-            
-            camera_image = st.camera_input("Take a photo of QR code or barcode")
-            code_data = None
-            code_type = None
-            
-            if camera_image is not None:
-                try:
-                    img = Image.open(camera_image)
-                    st.image(img, caption="Captured Image", width=300)
-                    with st.spinner("Decoding QR code/barcode..."):
-                        code_data, code_type = decode_any_code_from_image(img)
-                    if code_data:
-                        st.success(f"🔍 {code_type} detected: {code_data}")
-                    else:
-                        st.warning("❌ No QR code or barcode detected. Please try again.")
-                except Exception as e:
-                    st.error(f"Error processing image: {str(e)}")
-            
-            camera_student_id = st.text_input("Student ID *", value=code_data if code_data else "", 
-                                            key="camera_student_id", help="Auto-filled from scan or enter manually")
-            camera_student_name = st.text_input("Student Name *")
-            camera_course = st.text_input("Course")
-            
-            if st.form_submit_button("Add Student (Camera)"):
-                if not camera_student_id or not camera_student_name:
-                    st.error("Student ID and Name are required")
-                elif students_col.find_one({"student_id": camera_student_id}):
-                    st.warning("⚠️ Student ID already exists")
-                else:
-                    try:
-                        qr_path = make_qr(camera_student_id)
-                        barcode_path = make_barcode(camera_student_id)
-                        students_col.insert_one({
-                            "student_id": camera_student_id, 
-                            "name": camera_student_name, 
-                            "course": camera_course,
-                            "qr_path": qr_path,
-                            "barcode_path": barcode_path
-                        })
-                        st.success(f"✅ Student {camera_student_name} added successfully with QR code and barcode generated")
-                    except Exception as e:
-                        st.error(f"Error adding student: {e}")
-        
-        # Image Upload Form
-        st.markdown("#### 📁 Upload Image")
-        with st.form("add_student_upload"):
-            st.markdown("**Instructions:**")
-            st.markdown("- Upload an image containing the student's QR code or barcode")
-            st.markdown("- Ensure the image is clear and well-lit")
-            st.markdown("- The Student ID will be auto-filled after decoding")
-            
-            uploaded_image = st.file_uploader("Upload an image containing QR code or barcode", 
-                                            type=['png', 'jpg', 'jpeg'])
-            upload_code_data = None
-            upload_code_type = None
-            
-            if uploaded_image is not None:
-                try:
-                    img = Image.open(uploaded_image)
-                    st.image(img, caption="Uploaded Image", width=300)
-                    with st.spinner("Decoding QR code/barcode..."):
-                        upload_code_data, upload_code_type = decode_any_code_from_image(img)
-                    if upload_code_data:
-                        st.success(f"🔍 {upload_code_type} detected: {upload_code_data}")
-                    else:
-                        st.warning("❌ No QR code or barcode detected. Please try again.")
-                except Exception as e:
-                    st.error(f"Error processing image: {str(e)}")
-            
-            upload_student_id = st.text_input("Student ID *", value=upload_code_data if upload_code_data else "", 
-                                            key="upload_student_id", help="Auto-filled from upload or enter manually")
-            upload_student_name = st.text_input("Student Name *")
-            upload_course = st.text_input("Course")
-            
-            if st.form_submit_button("Add Student (Upload)"):
-                if not upload_student_id or not upload_student_name:
-                    st.error("Student ID and Name are required")
-                elif students_col.find_one({"student_id": upload_student_id}):
-                    st.warning("⚠️ Student ID already exists")
-                else:
-                    try:
-                        qr_path = make_qr(upload_student_id)
-                        barcode_path = make_barcode(upload_student_id)
-                        students_col.insert_one({
-                            "student_id": upload_student_id, 
-                            "name": upload_student_name, 
-                            "course": upload_course,
-                            "qr_path": qr_path,
-                            "barcode_path": barcode_path
-                        })
-                        st.success(f"✅ Student {upload_student_name} added successfully with QR code and barcode generated")
-                    except Exception as e:
-                        st.error(f"Error adding student: {e}")
-        
-        # Hardware Scanner Form
-        st.markdown("#### ⌨️ Hardware Scanner")
+        st.subheader("Add by QR/Barcode Scanner")
+        st.info("💡 Use this option if you have a barcode/QR code scanner device connected to your computer.")
         with st.form("add_student_scanner"):
             st.markdown("**Instructions:**")
-            st.markdown("- Connect your barcode/QR code scanner to your computer")
             st.markdown("- Click in the input field below")
-            st.markdown("- Scan the student's QR code or barcode")
-            st.markdown("- The Student ID will be auto-filled after scanning")
+            st.markdown("- Scan the student's QR code or barcode with your scanner device")
+            st.markdown("- The code data will appear automatically")
+            st.markdown("- Enter the student's name and course, then click 'Add Student' to save")
             
             scanner_code = st.text_input("Scan QR code or barcode here:", 
                                        placeholder="Click here and scan with your scanner", 
@@ -857,7 +1161,7 @@ elif nav == "Students":
             scanner_student_name = st.text_input("Student Name *")
             scanner_course = st.text_input("Course")
             
-            if st.form_submit_button("Add Student (Scanner)"):
+            if st.form_submit_button("Add Student"):
                 if not scanner_student_id or not scanner_student_name:
                     st.error("Student ID and Name are required")
                 elif students_col.find_one({"student_id": scanner_student_id}):
@@ -970,10 +1274,10 @@ elif nav == "Scan QR/Barcode":
     st.title("📷 Scan QR Code or Barcode for Attendance")
     
     chosen_date = st.date_input("Select Date", value=date.today())
-    st.info("📱 Take a photo of the student's QR code or barcode using the camera below")
+    st.info("📱 Scan a student's QR code or barcode using the camera or a hardware scanner")
     
     scan_method = st.radio("Choose scanning method:", 
-                          ["📷 Camera", "📁 Upload Image", "⌨️ Manual Barcode Scanner"])
+                          ["📷 Camera", "⌨️ Manual Barcode Scanner"])
     
     if scan_method == "📷 Camera":
         camera_image = st.camera_input("Take a photo of QR code or barcode")
@@ -984,7 +1288,7 @@ elif nav == "Scan QR/Barcode":
                 st.image(img, caption="Captured Image", width=300)
                 
                 with st.spinner("Decoding QR code/barcode..."):
-                    code_data, code_type = decode_any_code_from_image(img)
+                    code_data, code_type = decode_from_camera(img)
                     
                 if code_data:
                     st.success(f"🔍 {code_type} detected: {code_data}")
@@ -1013,58 +1317,21 @@ elif nav == "Scan QR/Barcode":
             except Exception as e:
                 st.error(f"Error processing image: {str(e)}")
     
-    elif scan_method == "📁 Upload Image":
-        uploaded_image = st.file_uploader("Upload an image containing QR code or barcode", 
-                                         type=['png', 'jpg', 'jpeg'])
-        
-        if uploaded_image is not None:
-            try:
-                img = Image.open(uploaded_image)
-                st.image(img, caption="Uploaded Image", width=300)
-                
-                with st.spinner("Decoding QR code/barcode..."):
-                    code_data, code_type = decode_any_code_from_image(img)
-                    
-                if code_data:
-                    st.success(f"🔍 {code_type} detected: {code_data}")
-                    
-                    student = students_col.find_one({"student_id": code_data})
-                    if not student:
-                        st.error("❌ Student not found in database")
-                    else:
-                        combined_datetime = datetime.combine(chosen_date, datetime.now().time())
-                        result = mark_attendance(
-                            code_data, 
-                            1,
-                            combined_datetime, 
-                            course=student.get("course"),
-                            method="upload_scan"
-                        )
-                        
-                        if "error" in result and result["error"] == "already":
-                            st.warning(f"⚠️ Attendance already marked for {student.get('name', code_data)} on {chosen_date}")
-                        else:
-                            st.success(f"✅ Marked {student.get('name', code_data)} as PRESENT for {chosen_date}")
-                else:
-                    st.warning("❌ No QR code or barcode detected in the image. Please try again.")
-                    
-            except Exception as e:
-                st.error(f"Error processing image: {str(e)}")
-    
     elif scan_method == "⌨️ Manual Barcode Scanner":
         st.info("💡 Use this option if you have a barcode scanner device connected to your computer.")
         st.markdown("**Instructions:**")
-        st.markdown("1. Click in the input field below")
-        st.markdown("2. Scan the barcode with your scanner device")
-        st.markdown("3. The barcode data will appear automatically")
-        st.markdown("4. Click 'Mark Attendance' to save")
+        st.markdown("- Click in the input field below")
+        st.markdown("- Scan the student's QR code or barcode with your scanner device")
+        st.markdown("- The code data will appear automatically")
+        st.markdown("- Click 'Mark Attendance' to save")
         
         with st.form("barcode_scanner"):
-            scanned_code = st.text_input("Scan barcode here:", placeholder="Click here and scan with your barcode scanner")
+            scanned_code = st.text_input("Scan QR code or barcode here:", 
+                                       placeholder="Click here and scan with your scanner")
             
             if st.form_submit_button("✅ Mark Attendance"):
                 if not scanned_code:
-                    st.error("Please scan a barcode first")
+                    st.error("Please scan a QR code or barcode first")
                 else:
                     student = students_col.find_one({"student_id": scanned_code})
                     if not student:
@@ -1526,7 +1793,7 @@ elif nav == "Attendance Records":
         course_filter = st.selectbox("Course Filter", courses)
     
     method_filter = st.selectbox("Attendance Method Filter", [
-        "All", "manual_entry", "camera_scan", "upload_scan", "scanner_device", 
+        "All", "manual_entry", "camera_scan", "scanner_device", 
         "bulk_entry", "session_link", "personal_link"
     ])
     
@@ -1592,33 +1859,29 @@ elif nav == "Settings":
                 st.error("All fields are required")
             elif new_password != confirm_password:
                 st.error("New passwords do not match")
-            elif authenticate(st.session_state.auth['username'], current_password):
-                try:
-                    if use_mongo:
-                        users_col.update_one(
-                            {"username": st.session_state.auth['username']}, 
-                            {"$set": {"password": generate_password_hash(new_password)}}
-                        )
-                    else:
-                        users_col.update_one(
-                            {"username": st.session_state.auth['username']}, 
-                            {"$set": {"password": generate_password_hash(new_password)}}, 
-                            upsert=True
-                        )
-                    st.success("✅ Password updated successfully")
-                except Exception as e:
-                    st.error(f"Error updating password: {e}")
             else:
-                st.error("❌ Current password is incorrect")
+                success, message = user_manager.change_password(
+                    st.session_state.auth['username'],
+                    current_password,
+                    new_password
+                )
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
     
     st.subheader("ℹ️ System Information")
     st.info(f"Database: {'MongoDB' if use_mongo else 'JSON Files'}")
-    
+
     students_count = students_col.count_documents({})
     attendance_count = att_col.count_documents({})
-    active_sessions = sessions_col.count_documents({"is_active": True}) if use_mongo else len([s for s in sessions_col.find({"is_active": True}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
-    active_links = links_col.count_documents({"is_active": True}) if use_mongo else len([l for l in links_col.find({"is_active": True}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
-    
+    if use_mongo:
+        active_sessions = sessions_col.count_documents({"is_active": True})
+        active_links = links_col.count_documents({"is_active": True})
+    else:
+        active_sessions = len([s for s in sessions_col.find({"is_active": True}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+        active_links = len([l for l in links_col.find({"is_active": True}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("👨‍🎓 Students", students_count)
@@ -1628,203 +1891,148 @@ elif nav == "Settings":
         st.metric("📋 Active Sessions", active_sessions)
     with col4:
         st.metric("🔗 Active Links", active_links)
-    
+
     if st.session_state.auth.get("role") == "admin":
         st.subheader("🗑️ Data Management (Admin Only)")
         st.warning("⚠️ The following actions are irreversible!")
-        
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Clear All Students & Attendance", type="secondary"):
-                try:
-                    students_col.delete_many({})
-                    att_col.delete_many({})
-                    st.success("✅ All student and attendance data cleared")
-                    
-                    import shutil
-                    for folder in [QR_FOLDER, BARCODE_FOLDER]:
-                        if os.path.exists(folder):
-                            shutil.rmtree(folder)
-                            os.makedirs(folder, exist_ok=True)
-                            
-                except Exception as e:
-                    st.error(f"Error clearing data: {e}")
-        
+                with st.form("confirm_clear_students"):
+                    st.warning("This will delete all students and attendance records. This action cannot be undone.")
+                    if st.form_submit_button("Confirm Clear Students"):
+                        try:
+                            students_col.delete_many({})
+                            att_col.delete_many({})
+                            st.success("✅ All student and attendance data cleared")
+                            for folder in [QR_FOLDER, BARCODE_FOLDER]:
+                                if os.path.exists(folder):
+                                    shutil.rmtree(folder)
+                                    os.makedirs(folder, exist_ok=True)
+                        except Exception as e:
+                            st.error(f"Error clearing data: {e}")
+
         with col2:
             if st.button("Clear All Links & Sessions", type="secondary"):
-                try:
-                    sessions_col.delete_many({})
-                    links_col.delete_many({})
-                    st.success("✅ All links and sessions cleared")
-                except Exception as e:
-                    st.error(f"Error clearing links: {e}")
+                with st.form("confirm_clear_links"):
+                    st.warning("This will delete all links and sessions. This action cannot be undone.")
+                    if st.form_submit_button("Confirm Clear Links"):
+                        try:
+                            sessions_col.delete_many({})
+                            links_col.delete_many({})
+                            st.success("✅ All links and sessions cleared")
+                        except Exception as e:
+                            st.error(f"Error clearing links: {e}")
 
 elif nav == "Teachers":
     st.title("👥 Teacher Management")
-    
+
     if st.session_state.auth.get("role") != "admin":
         st.warning("⚠️ This section is restricted to administrators only")
-    else:
-        st.subheader("➕ Add New Teacher")
-        with st.form("add_teacher"):
-            new_username = st.text_input("Username *")
-            new_password = st.text_input("Password *", type="password")
-            new_role = st.selectbox("Role", ["teacher", "admin"])
-            
-            if st.form_submit_button("Add Teacher"):
-                if not new_username or not new_password:
-                    st.error("Username and password are required")
-                elif users_col.find_one({"username": new_username}):
-                    st.error("❌ Username already exists")
-                else:
-                    try:
-                        users_col.insert_one({
-                            "username": new_username,
-                            "password": generate_password_hash(new_password),
-                            "role": new_role
-                        })
-                        st.success(f"✅ Teacher {new_username} added successfully with {new_role} role")
-                    except Exception as e:
-                        st.error(f"Error adding teacher: {e}")
-        
-        st.subheader("👥 Current Teachers")
-        try:
-            users = list(users_col.find({}))
-            if users:
-                users_display = []
-                for user in users:
-                    users_display.append({
-                        "Username": user.get("username", ""),
-                        "Role": user.get("role", "teacher"),
-                        "Created": "System" if user.get("username") == "admin" else "Manual"
-                    })
-                
-                users_df = pd.DataFrame(users_display)
-                st.dataframe(users_df, use_container_width=True)
-                
-                st.subheader("🗑️ Remove Teacher")
-                usernames_to_delete = [u["username"] for u in users if u["username"] != "admin"]
-                
-                if usernames_to_delete:
-                    with st.form("delete_teacher"):
-                        username_to_delete = st.selectbox("Select teacher to remove", usernames_to_delete)
-                        confirm_delete = st.checkbox("I confirm I want to delete this teacher")
-                        
-                        if st.form_submit_button("Delete Teacher", type="secondary"):
-                            if not confirm_delete:
-                                st.error("Please confirm the deletion")
-                            else:
-                                try:
-                                    result = users_col.delete_many({"username": username_to_delete})
-                                    if result.get("deleted_count", 0) > 0:
-                                        st.success(f"✅ Teacher {username_to_delete} removed successfully")
-                                    else:
-                                        st.error("Teacher not found or already deleted")
-                                except Exception as e:
-                                    st.error(f"Error deleting teacher: {e}")
-                else:
-                    st.info("Only the admin user exists. Add more teachers above.")
+        st.stop()
+
+    st.subheader("➕ Add New Teacher")
+    with st.form("add_teacher"):
+        username = st.text_input("Username *")
+        password = st.text_input("Password *", type="password")
+        email = st.text_input("Email *")
+        name = st.text_input("Full Name")
+        role = st.selectbox("Role", ["teacher", "admin"])
+
+        if st.form_submit_button("Add Teacher"):
+            success, message = user_manager.create_user(
+                username=username,
+                password=password,
+                email=email,
+                name=name,
+                role=role
+            )
+            if success:
+                # Auto-verify small convenience for admin-created users
+                user_manager.verify_email(username)
+                st.success(message)
             else:
-                st.info("No teachers found in the system.")
-        except Exception as e:
-            st.error(f"Error loading teachers: {e}")
+                st.error(message)
+
+    st.subheader("👥 Current Teachers")
+    try:
+        users = list(users_col.find({}))
+        if users:
+            users_display = []
+            for user in users:
+                created_at = user.get("created_at")
+                if not use_mongo and created_at:
+                    try:
+                        created_at = datetime.fromisoformat(created_at)
+                    except Exception:
+                        created_at = created_at
+                users_display.append({
+                    "Username": user.get("username", ""),
+                    "Name": user.get("name", ""),
+                    "Email": user.get("email", ""),
+                    "Role": user.get("role", "teacher"),
+                    "Status": user.get("status", "active"),
+                    "Last Login": user.get("last_login").strftime("%Y-%m-%d %H:%M") if user.get("last_login") and use_mongo else (user.get("last_login") or "Never"),
+                    "Created": "System" if user.get("username") == "admin" else (created_at.strftime("%Y-%m-%d %H:%M") if isinstance(created_at, datetime) else created_at or "N/A")
+                })
+
+            users_df = pd.DataFrame(users_display)
+            st.dataframe(users_df, use_container_width=True)
+
+            st.subheader("🗑️ Remove Teacher")
+            usernames_to_delete = [u["username"] for u in users if u["username"] != "admin"]
+
+            if usernames_to_delete:
+                with st.form("delete_teacher"):
+                    username_to_delete = st.selectbox("Select teacher to remove", usernames_to_delete)
+                    confirm_delete = st.checkbox("I confirm I want to delete this teacher")
+
+                    if st.form_submit_button("Delete Teacher", type="secondary"):
+                        if not confirm_delete:
+                            st.error("Please confirm the deletion")
+                        else:
+                            try:
+                                result = users_col.delete_many({"username": username_to_delete})
+                                deleted_count = getattr(result, "deleted_count", None)
+                                if deleted_count is None:
+                                    # SimpleCol returns dict
+                                    deleted_count = result.get("deleted_count", 0) if isinstance(result, dict) else 0
+
+                                if deleted_count > 0:
+                                    st.success(f"✅ Teacher {username_to_delete} removed successfully")
+                                    st.rerun()
+                                else:
+                                    st.error("Teacher not found or already deleted")
+                            except Exception as e:
+                                st.error(f"Error deleting teacher: {e}")
+            else:
+                st.info("Only the admin user exists. Add more teachers above.")
+        else:
+            st.info("No teachers found in the system.")
+    except Exception as e:
+        st.error(f"Error loading teachers: {e}")
+
+    st.subheader("🔑 Password Reset")
+    try:
+        users_list = [u for u in list(users_col.find({})) if u.get("username") != "admin"]
+        if users_list:
+            with st.form("reset_password_admin"):
+                username_to_reset = st.selectbox("Select user for password reset", [u["username"] for u in users_list])
+                if st.form_submit_button("Generate Reset Link"):
+                    success, token = user_manager.generate_reset_token(username_to_reset)
+                    if success:
+                        base_url = st.get_option('server.baseUrlPath') or 'http://localhost:8501'
+                        reset_url = f"{base_url}?reset_token={token}"
+                        st.success(f"✅ Reset link generated for {username_to_reset}")
+                        st.text_area("Share this reset link:", value=reset_url, height=100)
+                    else:
+                        st.error(token)
+        else:
+            st.info("No users available for password reset.")
+    except Exception as e:
+        st.error(f"Error generating reset link: {e}")
 
 # -------------------- Footer --------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Smart Attendance System v3.0 Enhanced**")
-st.sidebar.markdown("🔧 Database: " + ("MongoDB" if use_mongo else "JSON Files"))
-
-if nav == "Dashboard":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tip**: Use the pivot view to see attendance patterns across multiple days. Present=1, Absent=0.")
-
-elif nav == "Scan QR/Barcode":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tips**:\n- Ensure good lighting for camera scanning\n- Hold codes steady for best results\n- Use barcode scanner option for hardware scanners")
-
-elif nav == "Students":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tip**: Both QR codes and barcodes are generated for each student for maximum compatibility. Use the QR/barcode scan options to add students with existing codes.")
-
-elif nav == "Share Links":
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Link Types**:\n- Session links: For entire classes\n- Student links: Personal attendance links\n- Both expire automatically for security")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("📦 **Required Libraries:**")
-st.sidebar.markdown("""
-**Core (Required):**
-- `streamlit`
-- `pandas`
-- `pymongo`
-- `qrcode`
-- `opencv-python`
-- `Pillow`
-- `werkzeug`
-- `numpy`
-
-**Optional (for barcode support):**
-- `pyzbar` (requires system libraries)
-- `python-barcode`
-""")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("🚀 **Features Status:**")
-features_status = "✅ QR Code scanning & generation\n"
-if BARCODE_GENERATION_AVAILABLE:
-    features_status += "✅ Barcode generation\n"
-else:
-    features_status += "❌ Barcode generation (install python-barcode)\n"
-    
-if PYZBAR_AVAILABLE:
-    features_status += "✅ Barcode image scanning\n"
-else:
-    features_status += "❌ Barcode image scanning (install pyzbar)\n"
-
-features_status += """✅ Shareable attendance links
-✅ Session-based attendance
-✅ Personal student links
-✅ Multiple scanning methods
-✅ Hardware scanner support
-✅ Add students by existing QR/barcode
-✅ Enhanced security"""
-
-st.sidebar.markdown(features_status)
-
-if st.sidebar.button("📖 Deployment Guide"):
-    st.info("""
-    ## 🚀 Deployment Instructions
-    
-    ### Required Python Packages:
-    ```bash
-    pip install streamlit pandas pymongo qrcode opencv-python pyzbar python-barcode Pillow werkzeug numpy
-    ```
-    
-    ### For QR/Barcode scanning on Linux:
-    ```bash
-    sudo apt-get install libzbar0
-    ```
-    
-    ### Environment Variables (Optional):
-    - `MONGODB_URI`: MongoDB connection string
-    - `MONGODB_DB`: Database name
-    
-    ### Run the application:
-    ```bash
-    streamlit run app.py
-    ```
-    
-    ### Features:
-    1. **QR Code & Barcode Generation**: Automatic generation for all students
-    2. **Multiple Scanning Methods**: Camera, upload, hardware scanner
-    3. **Add Students by QR/Barcode**: Scan existing codes to add students
-    4. **Shareable Links**: Session and personal attendance links
-    5. **Enhanced Security**: Token-based links with expiration
-    6. **Flexible Database**: MongoDB or JSON file storage
-    
-    ### Sharing Links:
-    - Session links: Share with entire class for specific sessions
-    - Student links: Personal links for individual students
-    - All links expire automatically for security
-    - Generate QR codes for easy sharing
-    """)
