@@ -1934,9 +1934,13 @@ elif nav == "Share Links":
         st.markdown("### 👤 Active Student Links")
         try:
             if use_mongo:
-                links = list(links_col.find({"is_active": True, "expires_at": {"$gt": datetime.now()}}))
+                links_query = {"is_active": True, "expires_at": {"$gt": datetime.now()}}
+                links_query.update(get_user_filter())
+                links = list(links_col.find(links_query))
             else:
-                all_links = links_col.find({"is_active": True})
+                user_filter = get_user_filter()
+                base_filter = {"is_active": True, **user_filter}
+                all_links = links_col.find(base_filter)
                 links = [l for l in all_links if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()]
             
             if links:
