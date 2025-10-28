@@ -1177,6 +1177,7 @@ def display_student_attendance_form(link):
 
 # -------------------- Main Application Logic --------------------
 bootstrap_admin()
+migrate_existing_data_to_user_ownership()  # Run data migration for user isolation
 
 # Check cookie-based session
 if "session" in cookies and not st.session_state.auth["logged_in"]:
