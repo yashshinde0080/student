@@ -1690,10 +1690,10 @@ elif nav == "Manual Entry":
 elif nav == "Bulk Entry":
     require_reauth("bulk")
     st.title("📑 Bulk Attendance Entry")
-    
+
     selected_date = st.date_input("Select Date for Bulk Entry", value=date.today())
-    
-    students = list(students_col.find({}))
+
+    students = list(students_col.find(get_user_filter()))
     if not students:
         st.info("📭 No students found. Please add students first.")
     else:
