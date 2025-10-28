@@ -537,37 +537,47 @@ def decode_from_camera(pil_img):
         st.error(f"Decode error: {e}")
         return None, None
 
-def mark_attendance(student_id, status, when_dt=None, course=None, method="manual"):
+def mark_attendance(student_id, status, when_dt=None, course=None, method="manual", created_by_override=None):
     """Mark attendance for a student"""
     when_dt = when_dt or datetime.now()
     date_str = when_dt.date().isoformat()
-    
+
+    # Determine who is marking this attendance
+    if created_by_override:
+        created_by = created_by_override
+    elif "auth" in st.session_state and st.session_state.auth.get("logged_in"):
+        created_by = st.session_state.auth.get("username")
+    else:
+        created_by = "anonymous"  # Fallback for unauthenticated access
+
     if use_mongo:
         if att_col.find_one({"student_id": student_id, "date": date_str}):
             return {"error":"already"}
         doc = {
-            "student_id": student_id, 
-            "date": date_str, 
-            "time": when_dt.strftime("%H:%M:%S"), 
-            "status": int(status), 
-            "course": course, 
+            "student_id": student_id,
+            "date": date_str,
+            "time": when_dt.strftime("%H:%M:%S"),
+            "status": int(status),
+            "course": course,
             "method": method,
-            "ts": when_dt
+            "ts": when_dt,
+            "created_by": created_by
         }
         att_col.insert_one(doc)
         return {"ok":True, **doc}
     else:
         existing = att_col.find_one({"student_id": student_id, "date": date_str})
-        if existing: 
+        if existing:
             return {"error":"already"}
         doc = {
-            "student_id": student_id, 
-            "date": date_str, 
-            "time": when_dt.strftime("%H:%M:%S"), 
-            "status": int(status), 
-            "course": course, 
+            "student_id": student_id,
+            "date": date_str,
+            "time": when_dt.strftime("%H:%M:%S"),
+            "status": int(status),
+            "course": course,
             "method": method,
-            "ts": when_dt.isoformat()
+            "ts": when_dt.isoformat(),
+            "created_by": created_by
         }
         att_col.insert_one(doc)
         return {"ok":True, **doc}
