@@ -347,8 +347,22 @@ if st.sidebar.button("Logout", type="secondary"):
 # -------------------- Render Pages --------------------
 if nav == "Dashboard":
     dashboard.render(collections)
-else:
-    st.info(f"🚧 {nav} page - Use original app.py for full functionality (refactoring in progress)")
+elif nav == "Students":
+    students.render(collections)
+elif nav == "Scan QR/Barcode":
+    scan_qr_barcode.render(collections)
+elif nav == "Manual Entry":
+    manual_entry.render(collections, user_manager)
+elif nav == "Bulk Entry":
+    bulk_entry.render(collections, user_manager)
+elif nav == "Share Links":
+    share_links.render(collections, user_manager)
+elif nav == "Attendance Records":
+    attendance_records.render(collections)
+elif nav == "Settings":
+    settings.render(collections, user_manager)
+elif nav == "Teachers":
+    teachers.render(collections, user_manager)
 
 # Footer
 st.sidebar.markdown("---")
