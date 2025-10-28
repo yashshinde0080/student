@@ -1148,11 +1148,12 @@ def display_student_attendance_form(link):
     
     if st.button("✅ Mark Present for Today", type="primary", use_container_width=True):
         result = mark_attendance(
-            link["student_id"], 
+            link["student_id"],
             1,
-            datetime.now(), 
+            datetime.now(),
             course=student.get("course"),
-            method="personal_link"
+            method="personal_link",
+            created_by_override=link.get("created_by")
         )
         
         if "error" in result and result["error"] == "already":
