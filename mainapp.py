@@ -9,8 +9,8 @@ from database import get_collections, migrate_existing_data_to_user_ownership, u
 from auth import UserManager
 from helpers import decode_from_camera, mark_attendance, get_students_df
 
-# Import pages
-from pages import dashboard, students, scan_qr_barcode, manual_entry, bulk_entry, share_links, attendance_records, settings, teachers
+# Import views
+from views import dashboard, students, scan_qr_barcode, manual_entry, bulk_entry, share_links, attendance_records, settings, teachers
 
 # Page configuration
 st.set_page_config(page_title="Smart Attendance — Enhanced", layout="wide", initial_sidebar_state="expanded")
