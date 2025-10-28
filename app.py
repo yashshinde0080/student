@@ -2084,14 +2084,17 @@ elif nav == "Settings":
     st.subheader("ℹ️ System Information")
     st.info(f"Database: {'MongoDB' if use_mongo else 'JSON Files'}")
 
-    students_count = students_col.count_documents({})
-    attendance_count = att_col.count_documents({})
+    user_filter = get_user_filter()
+    students_count = students_col.count_documents(user_filter)
+    attendance_count = att_col.count_documents(user_filter)
     if use_mongo:
-        active_sessions = sessions_col.count_documents({"is_active": True})
-        active_links = links_col.count_documents({"is_active": True})
+        session_filter = {"is_active": True, **user_filter}
+        links_filter = {"is_active": True, **user_filter}
+        active_sessions = sessions_col.count_documents(session_filter)
+        active_links = links_col.count_documents(links_filter)
     else:
-        active_sessions = len([s for s in sessions_col.find({"is_active": True}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
-        active_links = len([l for l in links_col.find({"is_active": True}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+        active_sessions = len([s for s in sessions_col.find({"is_active": True, **user_filter}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+        active_links = len([l for l in links_col.find({"is_active": True, **user_filter}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
