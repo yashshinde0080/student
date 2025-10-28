@@ -1092,11 +1092,12 @@ def display_session_attendance_form(session):
                         st.warning("⚠️ Name doesn't match our records, but attendance will be marked.")
                     
                     result = mark_attendance(
-                        student_id, 
+                        student_id,
                         1,
-                        datetime.now(), 
+                        datetime.now(),
                         course=session.get("course"),
-                        method="session_link"
+                        method="session_link",
+                        created_by_override=session.get("created_by")
                     )
                     
                     if "error" in result and result["error"] == "already":
