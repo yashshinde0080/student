@@ -1,0 +1,28 @@
+[
+  {
+    "username": "admin",
+    "password": "pbkdf2:sha256:600000$kegyds4qvE4vpOMW$e4ead68948e32231d4c12993bbe0cfebf4d48a44658d530e50c1b9e564beefc7",
+    "email": "admin@example.com",
+    "name": "Administrator",
+    "role": "admin",
+    "created_at": "2025-10-28T21:56:01.480983",
+    "last_login": null,
+    "failed_attempts": 0,
+    "is_locked": false,
+    "lockout_until": null,
+    "status": "active"
+  },
+  {
+    "username": "yash",
+    "password": "pbkdf2:sha256:600000$3taDBbxXxg62OJuf$ea02b92fbc9b54e3d35b4e8487d3d2bbfd8e99e46343434d324884e8c6df4984",
+    "email": "syash0080@gmail.com",
+    "name": "yash shinde",
+    "role": "teacher",
+    "created_at": "2025-10-28T21:56:48.325153",
+    "last_login": null,
+    "failed_attempts": 0,
+    "is_locked": false,
+    "lockout_until": null,
+    "status": "active"
+  }
+]

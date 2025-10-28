@@ -11,7 +11,7 @@ def render(collections, user_manager):
     att_col = collections['attendance']
     use_mongo = collections['use_mongo']
 
-    st.title("✍️ Manual Attendance Entry & Edit")
+    st.title("✍ Manual Attendance Entry & Edit")
 
     tab1, tab2 = st.tabs(["New Entry", "Edit Attendance"])
 
@@ -50,7 +50,7 @@ def render(collections, user_manager):
                         )
 
                         if "error" in result and result["error"] == "already":
-                            st.warning(f"⚠️ Attendance already recorded for {student.get('name')} on {entry_date}")
+                            st.warning(f"⚠ Attendance already recorded for {student.get('name')} on {entry_date}")
                         else:
                             status_text = "PRESENT" if status[1] == 1 else "ABSENT"
                             st.success(f"✅ Marked {student.get('name')} as {status_text} for {entry_date}")
@@ -63,6 +63,9 @@ def render(collections, user_manager):
             search_date = st.date_input("Select Date", date.today())
         with col2:
             students_df = get_students_df(students_col)
+            if 'student_id' not in students_df.columns:
+                st.error("❌ 'student_id' column is missing in the students DataFrame.")
+                return
             student_options = ["All"] + sorted(students_df["student_id"].tolist())
             search_student = st.selectbox("Student ID", student_options)
         with col3:
@@ -89,12 +92,12 @@ def render(collections, user_manager):
                     col1, col2, col3 = st.columns([2, 2, 1])
 
                     with col1:
-                        st.write(f"**Course:** {record.get('course', 'N/A')}")
-                        st.write(f"**Time:** {record.get('time', 'N/A')}")
+                        st.write(f"*Course:* {record.get('course', 'N/A')}")
+                        st.write(f"*Time:* {record.get('time', 'N/A')}")
                     with col2:
-                        st.write(f"**Method:** {record.get('method', 'manual')}")
+                        st.write(f"*Method:* {record.get('method', 'manual')}")
                         current_status = "Present" if record.get("status", 0) == 1 else "Absent"
-                        st.write(f"**Current Status:** {current_status}")
+                        st.write(f"*Current Status:* {current_status}")
                     with col3:
                         new_status = st.selectbox(
                             "New Status",
@@ -156,7 +159,7 @@ def render(collections, user_manager):
                         )
 
                         if "error" in result and result["error"] == "already":
-                            st.warning("⚠️ Attendance record already exists for this date")
+                            st.warning("⚠ Attendance record already exists for this date")
                         else:
                             st.success("✅ Attendance record added successfully!")
                             st.rerun()

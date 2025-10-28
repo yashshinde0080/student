@@ -1,0 +1,10 @@
+[
+  {
+    "student_id": "001",
+    "name": "yash",
+    "course": "cs-aiml",
+    "qr_path": "D:\\00\\qrcodes\\001_qr.png",
+    "barcode_path": "D:\\00\\barcodes\\001_barcode.png",
+    "created_by": "yash"
+  }
+]
