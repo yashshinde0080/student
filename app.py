@@ -611,8 +611,8 @@ def create_student_attendance_link(student_id, duration_hours=168):
     return link_id, expires_at
 
 def get_students_df():
-    rows = students_col.find({})
-    if not rows: 
+    rows = students_col.find(get_user_filter())
+    if not rows:
         return pd.DataFrame(columns=["student_id","name","course","qr_path","barcode_path"])
     return pd.DataFrame(rows)
 
