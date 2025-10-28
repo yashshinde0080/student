@@ -1631,24 +1631,28 @@ elif nav == "Manual Entry":
                         )
                         
                         if st.button("Update", key=f"btn_{record['student_id']}_{record['date']}"):
-                            try:
-                                att_col.update_one(
-                                    {
-                                        "student_id": record["student_id"],
-                                        "date": record["date"]
-                                    },
-                                    {
-                                        "$set": {
-                                            "status": new_status[1],
-                                            "last_modified": datetime.now() if use_mongo else datetime.now().isoformat(),
-                                            "modified_by": st.session_state.auth["username"]
+                            # Verify ownership before updating
+                            if not is_admin() and record.get("created_by") != st.session_state.auth.get("username"):
+                                st.error("❌ You don't have permission to edit this record")
+                            else:
+                                try:
+                                    att_col.update_one(
+                                        {
+                                            "student_id": record["student_id"],
+                                            "date": record["date"]
+                                        },
+                                        {
+                                            "$set": {
+                                                "status": new_status[1],
+                                                "last_modified": datetime.now() if use_mongo else datetime.now().isoformat(),
+                                                "modified_by": st.session_state.auth["username"]
+                                            }
                                         }
-                                    }
-                                )
-                                st.success("✅ Attendance updated successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error updating attendance: {e}")
+                                    )
+                                    st.success("✅ Attendance updated successfully!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error updating attendance: {e}")
         else:
             st.info("No attendance records found for the selected criteria")
             
