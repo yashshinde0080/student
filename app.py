@@ -389,6 +389,90 @@ except Exception as e:
     sessions_col = SimpleCol(SESSIONS_FILE)
     links_col = SimpleCol(LINKS_FILE)
 
+# -------------------- Data Migration for User Isolation --------------------
+def migrate_existing_data_to_user_ownership():
+    """One-time migration to add created_by field to existing records"""
+    try:
+        # Find a default user to assign existing data to
+        admin_user = users_col.find_one({"role": "admin"})
+        if admin_user:
+            default_user = admin_user["username"]
+        else:
+            first_user = users_col.find_one({})
+            if not first_user:
+                print("Migration skipped: No users found in database")
+                return
+            default_user = first_user["username"]
+
+        print(f"Running data migration: assigning unowned data to '{default_user}'")
+
+        if use_mongo:
+            # MongoDB mode: use update_many with $exists operator
+            students_updated = students_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            att_updated = att_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            sessions_updated = sessions_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            links_updated = links_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+
+            print(f"Migration completed: {students_updated.modified_count} students, "
+                  f"{att_updated.modified_count} attendance records, "
+                  f"{sessions_updated.modified_count} sessions, "
+                  f"{links_updated.modified_count} links updated")
+        else:
+            # JSON mode: iterate and update documents manually
+            students_count = 0
+            students_data = students_col._load()
+            for doc in students_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    students_count += 1
+            if students_count > 0:
+                students_col._save(students_data)
+
+            att_count = 0
+            att_data = att_col._load()
+            for doc in att_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    att_count += 1
+            if att_count > 0:
+                att_col._save(att_data)
+
+            sessions_count = 0
+            sessions_data = sessions_col._load()
+            for doc in sessions_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    sessions_count += 1
+            if sessions_count > 0:
+                sessions_col._save(sessions_data)
+
+            links_count = 0
+            links_data = links_col._load()
+            for doc in links_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    links_count += 1
+            if links_count > 0:
+                links_col._save(links_data)
+
+            print(f"Migration completed: {students_count} students, {att_count} attendance records, "
+                  f"{sessions_count} sessions, {links_count} links updated")
+
+    except Exception as e:
+        print(f"Migration error (non-critical): {e}")
+
 # Initialize UserManager
 user_manager = UserManager(users_col)
 
