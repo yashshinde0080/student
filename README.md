@@ -1,19 +1,46 @@
+# Smart Attendance System - Multi-File Architecture
 
-Smart Attendance — Complete Secure Package
------------------------------------------
+## Overview
+Refactored Smart Attendance System with proper authentication, user data isolation, and modular structure.
 
-Features:
-- Login (users stored in MongoDB or local JSON fallback)
-- Role-based users (admin/teacher)
-- Admin bootstrap (default admin created on first run)
-- Student management (add single + CSV bulk upload + QR generation)
-- QR attendance via webcam (one mark per student per date)
-- Manual single attendance (re-auth required)
-- Bulk manual attendance with DataFrame preview (re-auth required)
-- Attendance pivot/dashboard with CSV/Excel export
-- Settings and Teachers management (admin-only functions)
-- Works offline without MongoDB using local ./data JSON files
+## Running the Application
 
-Run:
-1. pip install -r requirements.txt
-2. streamlit run streamlit_app.py
+### New Multi-File App:
+```bash
+streamlit run mainapp.py
+```
+
+### Original App (full features):
+```bash
+streamlit run app.py
+```
+
+## Default Admin Credentials
+- Username: `admin`
+- Password: `Admin@123`
+
+## Key Changes
+- ✅ Removed 2FA verification
+- ✅ Fixed authentication flows
+- ✅ User data isolation (teachers see only their data)
+- ✅ Multi-file architecture (easier maintenance)
+
+## Project Structure
+```
+student/
+├── mainapp.py       # Main entry point
+├── auth.py          # Authentication (no 2FA)
+├── database.py      # Database setup
+├── helpers.py       # Helper functions
+└── pages/           # Page modules
+    ├── dashboard.py
+    ├── students.py
+    └── settings.py
+```
+
+## Features
+- Teacher/Admin roles with proper isolation
+- QR/Barcode attendance scanning
+- Manual & bulk entry
+- Shareable attendance links
+- Data export (CSV/Excel)
