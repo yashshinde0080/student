@@ -476,6 +476,25 @@ def migrate_existing_data_to_user_ownership():
 # Initialize UserManager
 user_manager = UserManager(users_col)
 
+# -------------------- User Isolation Helpers --------------------
+def get_user_filter():
+    """Returns MongoDB filter dict for current user's data isolation"""
+    if "auth" not in st.session_state or not st.session_state.auth.get("logged_in"):
+        return {"created_by": None}  # Safety: match nothing if not authenticated
+
+    role = st.session_state.auth.get("role")
+    if role == "admin":
+        return {}  # Admins see all data
+
+    username = st.session_state.auth.get("username")
+    return {"created_by": username}  # Teachers see only their data
+
+def is_admin():
+    """Check if current user is admin"""
+    if "auth" not in st.session_state:
+        return False
+    return st.session_state.auth.get("role") == "admin"
+
 # -------------------- Helpers --------------------
 QR_FOLDER = os.path.join(os.path.dirname(__file__), "qrcodes")
 BARCODE_FOLDER = os.path.join(os.path.dirname(__file__), "barcodes")
