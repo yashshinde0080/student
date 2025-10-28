@@ -264,7 +264,9 @@ try:
     users_col.create_index("email", unique=True, sparse=True)
     users_col.create_index("password_reset_token")
     students_col.create_index("student_id", unique=True)
+    students_col.create_index("created_by")  # Index for user isolation
     att_col.create_index([("student_id", 1), ("date", 1)], unique=True)
+    att_col.create_index("created_by")  # Index for user isolation
     sessions_col.create_index("session_id", unique=True)
     sessions_col.create_index("expires_at", expireAfterSeconds=0)
     links_col.create_index("link_id", unique=True)
@@ -387,8 +389,111 @@ except Exception as e:
     sessions_col = SimpleCol(SESSIONS_FILE)
     links_col = SimpleCol(LINKS_FILE)
 
+# -------------------- Data Migration for User Isolation --------------------
+def migrate_existing_data_to_user_ownership():
+    """One-time migration to add created_by field to existing records"""
+    try:
+        # Find a default user to assign existing data to
+        admin_user = users_col.find_one({"role": "admin"})
+        if admin_user:
+            default_user = admin_user["username"]
+        else:
+            first_user = users_col.find_one({})
+            if not first_user:
+                print("Migration skipped: No users found in database")
+                return
+            default_user = first_user["username"]
+
+        print(f"Running data migration: assigning unowned data to '{default_user}'")
+
+        if use_mongo:
+            # MongoDB mode: use update_many with $exists operator
+            students_updated = students_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            att_updated = att_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            sessions_updated = sessions_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+            links_updated = links_col.update_many(
+                {"created_by": {"$exists": False}},
+                {"$set": {"created_by": default_user}}
+            )
+
+            print(f"Migration completed: {students_updated.modified_count} students, "
+                  f"{att_updated.modified_count} attendance records, "
+                  f"{sessions_updated.modified_count} sessions, "
+                  f"{links_updated.modified_count} links updated")
+        else:
+            # JSON mode: iterate and update documents manually
+            students_count = 0
+            students_data = students_col._load()
+            for doc in students_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    students_count += 1
+            if students_count > 0:
+                students_col._save(students_data)
+
+            att_count = 0
+            att_data = att_col._load()
+            for doc in att_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    att_count += 1
+            if att_count > 0:
+                att_col._save(att_data)
+
+            sessions_count = 0
+            sessions_data = sessions_col._load()
+            for doc in sessions_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    sessions_count += 1
+            if sessions_count > 0:
+                sessions_col._save(sessions_data)
+
+            links_count = 0
+            links_data = links_col._load()
+            for doc in links_data:
+                if "created_by" not in doc:
+                    doc["created_by"] = default_user
+                    links_count += 1
+            if links_count > 0:
+                links_col._save(links_data)
+
+            print(f"Migration completed: {students_count} students, {att_count} attendance records, "
+                  f"{sessions_count} sessions, {links_count} links updated")
+
+    except Exception as e:
+        print(f"Migration error (non-critical): {e}")
+
 # Initialize UserManager
 user_manager = UserManager(users_col)
+
+# -------------------- User Isolation Helpers --------------------
+def get_user_filter():
+    """Returns MongoDB filter dict for current user's data isolation"""
+    if "auth" not in st.session_state or not st.session_state.auth.get("logged_in"):
+        return {"created_by": None}  # Safety: match nothing if not authenticated
+
+    role = st.session_state.auth.get("role")
+    if role == "admin":
+        return {}  # Admins see all data
+
+    username = st.session_state.auth.get("username")
+    return {"created_by": username}  # Teachers see only their data
+
+def is_admin():
+    """Check if current user is admin"""
+    if "auth" not in st.session_state:
+        return False
+    return st.session_state.auth.get("role") == "admin"
 
 # -------------------- Helpers --------------------
 QR_FOLDER = os.path.join(os.path.dirname(__file__), "qrcodes")
@@ -432,37 +537,47 @@ def decode_from_camera(pil_img):
         st.error(f"Decode error: {e}")
         return None, None
 
-def mark_attendance(student_id, status, when_dt=None, course=None, method="manual"):
+def mark_attendance(student_id, status, when_dt=None, course=None, method="manual", created_by_override=None):
     """Mark attendance for a student"""
     when_dt = when_dt or datetime.now()
     date_str = when_dt.date().isoformat()
-    
+
+    # Determine who is marking this attendance
+    if created_by_override:
+        created_by = created_by_override
+    elif "auth" in st.session_state and st.session_state.auth.get("logged_in"):
+        created_by = st.session_state.auth.get("username")
+    else:
+        created_by = "anonymous"  # Fallback for unauthenticated access
+
     if use_mongo:
         if att_col.find_one({"student_id": student_id, "date": date_str}):
             return {"error":"already"}
         doc = {
-            "student_id": student_id, 
-            "date": date_str, 
-            "time": when_dt.strftime("%H:%M:%S"), 
-            "status": int(status), 
-            "course": course, 
+            "student_id": student_id,
+            "date": date_str,
+            "time": when_dt.strftime("%H:%M:%S"),
+            "status": int(status),
+            "course": course,
             "method": method,
-            "ts": when_dt
+            "ts": when_dt,
+            "created_by": created_by
         }
         att_col.insert_one(doc)
         return {"ok":True, **doc}
     else:
         existing = att_col.find_one({"student_id": student_id, "date": date_str})
-        if existing: 
+        if existing:
             return {"error":"already"}
         doc = {
-            "student_id": student_id, 
-            "date": date_str, 
-            "time": when_dt.strftime("%H:%M:%S"), 
-            "status": int(status), 
-            "course": course, 
+            "student_id": student_id,
+            "date": date_str,
+            "time": when_dt.strftime("%H:%M:%S"),
+            "status": int(status),
+            "course": course,
             "method": method,
-            "ts": when_dt.isoformat()
+            "ts": when_dt.isoformat(),
+            "created_by": created_by
         }
         att_col.insert_one(doc)
         return {"ok":True, **doc}
@@ -506,38 +621,40 @@ def create_student_attendance_link(student_id, duration_hours=168):
     return link_id, expires_at
 
 def get_students_df():
-    rows = students_col.find({})
-    if not rows: 
+    rows = students_col.find(get_user_filter())
+    if not rows:
         return pd.DataFrame(columns=["student_id","name","course","qr_path","barcode_path"])
     return pd.DataFrame(rows)
 
 def get_attendance_rows(start=None, end=None, course=None):
     if use_mongo:
         q = {}
-        if start or end: 
+        if start or end:
             q["date"] = {}
-        if start: 
+        if start:
             q["date"]["$gte"] = start.isoformat()
-        if end: 
+        if end:
             q["date"]["$lte"] = end.isoformat()
-        if course and course!="All": 
+        if course and course!="All":
             q["course"]=course
+        q.update(get_user_filter())  # Add user isolation filter
         rows = list(att_col.find(q))
         return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["student_id","date","status","time","course","method"])
     else:
-        rows = att_col.find({})
+        user_filter = get_user_filter()
+        rows = att_col.find(user_filter)  # Apply user isolation filter
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["student_id","date","status","time","course","method"])
-        
+
         if not df.empty and (start or end):
             df = df.copy()
             if start:
                 df = df[df["date"] >= start.isoformat()]
             if end:
                 df = df[df["date"] <= end.isoformat()]
-        
+
         if not df.empty and course and course != "All":
             df = df[df["course"] == course]
-            
+
         return df
 
 def pivot_attendance(start, end, course=None):
@@ -975,11 +1092,12 @@ def display_session_attendance_form(session):
                         st.warning("⚠️ Name doesn't match our records, but attendance will be marked.")
                     
                     result = mark_attendance(
-                        student_id, 
+                        student_id,
                         1,
-                        datetime.now(), 
+                        datetime.now(),
                         course=session.get("course"),
-                        method="session_link"
+                        method="session_link",
+                        created_by_override=session.get("created_by")
                     )
                     
                     if "error" in result and result["error"] == "already":
@@ -1030,11 +1148,12 @@ def display_student_attendance_form(link):
     
     if st.button("✅ Mark Present for Today", type="primary", use_container_width=True):
         result = mark_attendance(
-            link["student_id"], 
+            link["student_id"],
             1,
-            datetime.now(), 
+            datetime.now(),
             course=student.get("course"),
-            method="personal_link"
+            method="personal_link",
+            created_by_override=link.get("created_by")
         )
         
         if "error" in result and result["error"] == "already":
@@ -1058,6 +1177,7 @@ def display_student_attendance_form(link):
 
 # -------------------- Main Application Logic --------------------
 bootstrap_admin()
+migrate_existing_data_to_user_ownership()  # Run data migration for user isolation
 
 # Check cookie-based session
 if "session" in cookies and not st.session_state.auth["logged_in"]:
@@ -1196,11 +1316,12 @@ elif nav == "Students":
                         qr_path = make_qr(sid)
                         barcode_path = make_barcode(sid)
                         students_col.insert_one({
-                            "student_id": sid, 
-                            "name": name, 
+                            "student_id": sid,
+                            "name": name,
                             "course": course,
                             "qr_path": qr_path,
-                            "barcode_path": barcode_path
+                            "barcode_path": barcode_path,
+                            "created_by": st.session_state.auth.get("username")
                         })
                         st.success(f"✅ Student {name} added successfully with QR code and barcode generated")
                     except Exception as e:
@@ -1236,11 +1357,12 @@ elif nav == "Students":
                         qr_path = make_qr(scanner_student_id)
                         barcode_path = make_barcode(scanner_student_id)
                         students_col.insert_one({
-                            "student_id": scanner_student_id, 
-                            "name": scanner_student_name, 
+                            "student_id": scanner_student_id,
+                            "name": scanner_student_name,
                             "course": scanner_course,
                             "qr_path": qr_path,
-                            "barcode_path": barcode_path
+                            "barcode_path": barcode_path,
+                            "created_by": st.session_state.auth.get("username")
                         })
                         st.success(f"✅ Student {scanner_student_name} added successfully with QR code and barcode generated")
                     except Exception as e:
@@ -1273,11 +1395,12 @@ elif nav == "Students":
                         qr_path = make_qr(sid)
                         barcode_path = make_barcode(sid)
                         students_col.insert_one({
-                            "student_id": sid, 
-                            "name": name, 
+                            "student_id": sid,
+                            "name": name,
                             "course": course,
                             "qr_path": qr_path,
-                            "barcode_path": barcode_path
+                            "barcode_path": barcode_path,
+                            "created_by": st.session_state.auth.get("username")
                         })
                         inserted += 1
                     except Exception as e:
@@ -1479,7 +1602,8 @@ elif nav == "Manual Entry":
             query["student_id"] = search_student
         if search_course != "All":
             query["course"] = search_course
-            
+        query.update(get_user_filter())  # Add user isolation filter
+
         attendance_records = list(att_col.find(query))
         
         if attendance_records:
@@ -1508,24 +1632,28 @@ elif nav == "Manual Entry":
                         )
                         
                         if st.button("Update", key=f"btn_{record['student_id']}_{record['date']}"):
-                            try:
-                                att_col.update_one(
-                                    {
-                                        "student_id": record["student_id"],
-                                        "date": record["date"]
-                                    },
-                                    {
-                                        "$set": {
-                                            "status": new_status[1],
-                                            "last_modified": datetime.now() if use_mongo else datetime.now().isoformat(),
-                                            "modified_by": st.session_state.auth["username"]
+                            # Verify ownership before updating
+                            if not is_admin() and record.get("created_by") != st.session_state.auth.get("username"):
+                                st.error("❌ You don't have permission to edit this record")
+                            else:
+                                try:
+                                    att_col.update_one(
+                                        {
+                                            "student_id": record["student_id"],
+                                            "date": record["date"]
+                                        },
+                                        {
+                                            "$set": {
+                                                "status": new_status[1],
+                                                "last_modified": datetime.now() if use_mongo else datetime.now().isoformat(),
+                                                "modified_by": st.session_state.auth["username"]
+                                            }
                                         }
-                                    }
-                                )
-                                st.success("✅ Attendance updated successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error updating attendance: {e}")
+                                    )
+                                    st.success("✅ Attendance updated successfully!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error updating attendance: {e}")
         else:
             st.info("No attendance records found for the selected criteria")
             
@@ -1562,10 +1690,10 @@ elif nav == "Manual Entry":
 elif nav == "Bulk Entry":
     require_reauth("bulk")
     st.title("📑 Bulk Attendance Entry")
-    
+
     selected_date = st.date_input("Select Date for Bulk Entry", value=date.today())
-    
-    students = list(students_col.find({}))
+
+    students = list(students_col.find(get_user_filter()))
     if not students:
         st.info("📭 No students found. Please add students first.")
     else:
@@ -1777,9 +1905,13 @@ elif nav == "Share Links":
         st.markdown("### 📋 Active Sessions")
         try:
             if use_mongo:
-                sessions = list(sessions_col.find({"is_active": True, "expires_at": {"$gt": datetime.now()}}))
+                session_query = {"is_active": True, "expires_at": {"$gt": datetime.now()}}
+                session_query.update(get_user_filter())
+                sessions = list(sessions_col.find(session_query))
             else:
-                all_sessions = sessions_col.find({"is_active": True})
+                user_filter = get_user_filter()
+                base_filter = {"is_active": True, **user_filter}
+                all_sessions = sessions_col.find(base_filter)
                 sessions = [s for s in all_sessions if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()]
             
             if sessions:
@@ -1810,9 +1942,13 @@ elif nav == "Share Links":
         st.markdown("### 👤 Active Student Links")
         try:
             if use_mongo:
-                links = list(links_col.find({"is_active": True, "expires_at": {"$gt": datetime.now()}}))
+                links_query = {"is_active": True, "expires_at": {"$gt": datetime.now()}}
+                links_query.update(get_user_filter())
+                links = list(links_col.find(links_query))
             else:
-                all_links = links_col.find({"is_active": True})
+                user_filter = get_user_filter()
+                base_filter = {"is_active": True, **user_filter}
+                all_links = links_col.find(base_filter)
                 links = [l for l in all_links if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()]
             
             if links:
@@ -1948,14 +2084,17 @@ elif nav == "Settings":
     st.subheader("ℹ️ System Information")
     st.info(f"Database: {'MongoDB' if use_mongo else 'JSON Files'}")
 
-    students_count = students_col.count_documents({})
-    attendance_count = att_col.count_documents({})
+    user_filter = get_user_filter()
+    students_count = students_col.count_documents(user_filter)
+    attendance_count = att_col.count_documents(user_filter)
     if use_mongo:
-        active_sessions = sessions_col.count_documents({"is_active": True})
-        active_links = links_col.count_documents({"is_active": True})
+        session_filter = {"is_active": True, **user_filter}
+        links_filter = {"is_active": True, **user_filter}
+        active_sessions = sessions_col.count_documents(session_filter)
+        active_links = links_col.count_documents(links_filter)
     else:
-        active_sessions = len([s for s in sessions_col.find({"is_active": True}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
-        active_links = len([l for l in links_col.find({"is_active": True}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+        active_sessions = len([s for s in sessions_col.find({"is_active": True, **user_filter}) if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
+        active_links = len([l for l in links_col.find({"is_active": True, **user_filter}) if l.get("expires_at", "9999-12-31") > datetime.now().isoformat()])
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
