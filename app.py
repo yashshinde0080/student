@@ -619,30 +619,32 @@ def get_students_df():
 def get_attendance_rows(start=None, end=None, course=None):
     if use_mongo:
         q = {}
-        if start or end: 
+        if start or end:
             q["date"] = {}
-        if start: 
+        if start:
             q["date"]["$gte"] = start.isoformat()
-        if end: 
+        if end:
             q["date"]["$lte"] = end.isoformat()
-        if course and course!="All": 
+        if course and course!="All":
             q["course"]=course
+        q.update(get_user_filter())  # Add user isolation filter
         rows = list(att_col.find(q))
         return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["student_id","date","status","time","course","method"])
     else:
-        rows = att_col.find({})
+        user_filter = get_user_filter()
+        rows = att_col.find(user_filter)  # Apply user isolation filter
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["student_id","date","status","time","course","method"])
-        
+
         if not df.empty and (start or end):
             df = df.copy()
             if start:
                 df = df[df["date"] >= start.isoformat()]
             if end:
                 df = df[df["date"] <= end.isoformat()]
-        
+
         if not df.empty and course and course != "All":
             df = df[df["course"] == course]
-            
+
         return df
 
 def pivot_attendance(start, end, course=None):
