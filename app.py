@@ -1897,9 +1897,13 @@ elif nav == "Share Links":
         st.markdown("### 📋 Active Sessions")
         try:
             if use_mongo:
-                sessions = list(sessions_col.find({"is_active": True, "expires_at": {"$gt": datetime.now()}}))
+                session_query = {"is_active": True, "expires_at": {"$gt": datetime.now()}}
+                session_query.update(get_user_filter())
+                sessions = list(sessions_col.find(session_query))
             else:
-                all_sessions = sessions_col.find({"is_active": True})
+                user_filter = get_user_filter()
+                base_filter = {"is_active": True, **user_filter}
+                all_sessions = sessions_col.find(base_filter)
                 sessions = [s for s in all_sessions if s.get("expires_at", "9999-12-31") > datetime.now().isoformat()]
             
             if sessions:
