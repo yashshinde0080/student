@@ -1601,7 +1601,8 @@ elif nav == "Manual Entry":
             query["student_id"] = search_student
         if search_course != "All":
             query["course"] = search_course
-            
+        query.update(get_user_filter())  # Add user isolation filter
+
         attendance_records = list(att_col.find(query))
         
         if attendance_records:
