@@ -1313,11 +1313,12 @@ elif nav == "Students":
                         qr_path = make_qr(sid)
                         barcode_path = make_barcode(sid)
                         students_col.insert_one({
-                            "student_id": sid, 
-                            "name": name, 
+                            "student_id": sid,
+                            "name": name,
                             "course": course,
                             "qr_path": qr_path,
-                            "barcode_path": barcode_path
+                            "barcode_path": barcode_path,
+                            "created_by": st.session_state.auth.get("username")
                         })
                         st.success(f"✅ Student {name} added successfully with QR code and barcode generated")
                     except Exception as e:
