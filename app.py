@@ -264,7 +264,9 @@ try:
     users_col.create_index("email", unique=True, sparse=True)
     users_col.create_index("password_reset_token")
     students_col.create_index("student_id", unique=True)
+    students_col.create_index("created_by")  # Index for user isolation
     att_col.create_index([("student_id", 1), ("date", 1)], unique=True)
+    att_col.create_index("created_by")  # Index for user isolation
     sessions_col.create_index("session_id", unique=True)
     sessions_col.create_index("expires_at", expireAfterSeconds=0)
     links_col.create_index("link_id", unique=True)
